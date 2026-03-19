@@ -21,6 +21,7 @@ services:
     image: serjs/go-socks5-proxy
     restart: unless-stopped
     environment:
+      - REQUIRE_AUTH="false"
       - PROXY_USER=${SOCKS_USER:-}
       - PROXY_PASSWORD=${SOCKS_PASSWORD:-}
     profiles:
