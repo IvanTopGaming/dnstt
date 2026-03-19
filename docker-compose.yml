@@ -1,0 +1,42 @@
+services:
+  dnstt-server:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "53:53/udp"
+    volumes:
+      - ./keys:/keys
+    command:
+      - -udp
+      - ":53"
+      - -privkey-file
+      - /keys/server.key
+      - "${DNSTT_DOMAIN:?DNSTT_DOMAIN is required (e.g. t.example.com)}"
+      - "${DNSTT_UPSTREAM:?DNSTT_UPSTREAM is required}"
+
+  # SOCKS5 proxy (profile: socks)
+  # Запуск: docker compose --profile socks up -d
+  # DNSTT_UPSTREAM=socks5:1080 (или оставить дефолт в .env)
+  socks5:
+    image: serjs/go-socks5-proxy
+    restart: unless-stopped
+    environment:
+      - PROXY_USER=${SOCKS_USER:-}
+      - PROXY_PASSWORD=${SOCKS_PASSWORD:-}
+    profiles:
+      - socks
+
+  # Генерация ключей (один раз):
+  #   docker compose run --rm keygen
+  keygen:
+    build: .
+    volumes:
+      - ./keys:/keys
+    command:
+      - -gen-key
+      - -privkey-file
+      - /keys/server.key
+      - -pubkey-file
+      - /keys/server.pub
+    profiles:
+      - keygen
