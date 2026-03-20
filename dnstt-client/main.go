@@ -48,9 +48,12 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
@@ -162,7 +165,7 @@ func handle(local *net.TCPConn, sess *smux.Session, conv uint32) error {
 	return err
 }
 
-func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.Addr, pconn net.PacketConn) error {
+func run(ctx context.Context, pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.Addr, pconn net.PacketConn) error {
 	defer pconn.Close()
 
 	ln, err := net.ListenTCP("tcp", localAddr)
@@ -170,6 +173,14 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 		return fmt.Errorf("opening local listener: %v", err)
 	}
 	defer ln.Close()
+
+	// Close the listener and the transport when the context is cancelled,
+	// unblocking Accept and any pending sends.
+	go func() {
+		<-ctx.Done()
+		ln.Close()
+		pconn.Close()
+	}()
 
 	mtu := dnsNameCapacity(domain) - 8 - 1 - numPadding - 1 // clientid + padding length prefix + padding + data length prefix
 	if mtu < 80 {
@@ -198,8 +209,8 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 		1, // nc=1 => congestion window off
 	)
 	conn.SetWindowSize(turbotunnel.QueueSize/2, turbotunnel.QueueSize/2)
-	if rc := conn.SetMtu(mtu); !rc {
-		panic(rc)
+	if !conn.SetMtu(mtu) {
+		return fmt.Errorf("SetMtu(%d) failed", mtu)
 	}
 
 	// Put a Noise channel on top of the KCP conn.
@@ -222,9 +233,6 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 	for {
 		local, err := ln.Accept()
 		if err != nil {
-			if err, ok := err.(net.Error); ok && err.Temporary() {
-				continue
-			}
 			return err
 		}
 		go func() {
@@ -239,6 +247,8 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 
 func main() {
 	var dohURL string
+	var dohAddr string
+	var doqAddr string
 	var dotAddr string
 	var pubkeyFilename string
 	var pubkeyString string
@@ -278,6 +288,8 @@ Known TLS fingerprints for -utls are:
 		}
 	}
 	flag.StringVar(&dohURL, "doh", "", "URL of DoH resolver")
+	flag.StringVar(&dohAddr, "doh-addr", "", "dial this address for DoH instead of resolving the URL host (e.g. 1.2.3.4:443)")
+	flag.StringVar(&doqAddr, "doq", "", "address of DoQ resolver (e.g. dns.example.com:853)")
 	flag.StringVar(&dotAddr, "dot", "", "address of DoT resolver")
 	flag.StringVar(&pubkeyString, "pubkey", "", fmt.Sprintf("server public key (%d hex digits)", noise.KeyLen*2))
 	flag.StringVar(&pubkeyFilename, "pubkey-file", "", "read server public key from file")
@@ -337,6 +349,11 @@ Known TLS fingerprints for -utls are:
 		log.Printf("uTLS fingerprint %s %s", utlsClientHelloID.Client, utlsClientHelloID.Version)
 	}
 
+	if dohAddr != "" && dohURL == "" {
+		fmt.Fprintf(os.Stderr, "-doh-addr requires -doh\n")
+		os.Exit(1)
+	}
+
 	// Iterate over the remote resolver address options and select one and
 	// only one.
 	var remoteAddr net.Addr
@@ -357,11 +374,30 @@ Known TLS fingerprints for -utls are:
 				// which do not take a proxy from the
 				// environment.
 				transport.Proxy = nil
+				if dohAddr != "" {
+					// Override the dial address while keeping
+					// the SNI from the URL hostname.
+					u, err := url.Parse(dohURL)
+					if err != nil {
+						return nil, nil, err
+					}
+					serverName := u.Hostname()
+					override := dohAddr
+					transport.DialTLSContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+						return (&tls.Dialer{Config: &tls.Config{ServerName: serverName}}).DialContext(ctx, network, override)
+					}
+				}
 				rt = transport
 			} else {
-				rt = NewUTLSRoundTripper(nil, utlsClientHelloID)
+				rt = NewUTLSRoundTripper(nil, utlsClientHelloID, dohAddr)
 			}
 			pconn, err := NewHTTPPacketConn(rt, dohURL, 32)
+			return addr, pconn, err
+		}},
+		// -doq
+		{doqAddr, func(s string) (net.Addr, net.PacketConn, error) {
+			addr := turbotunnel.DummyAddr{}
+			pconn, err := NewQUICPacketConn(s, nil)
 			return addr, pconn, err
 		}},
 		// -dot
@@ -392,7 +428,7 @@ Known TLS fingerprints for -utls are:
 			continue
 		}
 		if pconn != nil {
-			fmt.Fprintf(os.Stderr, "only one of -doh, -dot, and -udp may be given\n")
+			fmt.Fprintf(os.Stderr, "only one of -doh, -doq, -dot, and -udp may be given\n")
 			os.Exit(1)
 		}
 		var err error
@@ -403,13 +439,21 @@ Known TLS fingerprints for -utls are:
 		}
 	}
 	if pconn == nil {
-		fmt.Fprintf(os.Stderr, "one of -doh, -dot, or -udp is required\n")
+		fmt.Fprintf(os.Stderr, "one of -doh, -doq, -dot, or -udp is required\n")
 		os.Exit(1)
 	}
 
-	pconn = NewDNSPacketConn(pconn, remoteAddr, domain)
-	err = run(pubkey, domain, localAddr, remoteAddr, pconn)
-	if err != nil {
+	// Set up graceful shutdown on SIGINT/SIGTERM.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// DoQ has its own packet-level transport and doesn't go through
+	// DNSPacketConn encoding; wrap only for DNS-based transports.
+	if doqAddr == "" {
+		pconn = NewDNSPacketConn(pconn, remoteAddr, domain)
+	}
+	err = run(ctx, pubkey, domain, localAddr, remoteAddr, pconn)
+	if err != nil && ctx.Err() == nil {
 		log.Fatal(err)
 	}
 }
