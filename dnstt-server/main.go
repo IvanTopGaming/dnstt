@@ -40,17 +40,25 @@ package main
 
 import (
 	"bytes"
+	"compress/zlib"
 	"context"
 	"encoding/base32"
 	"encoding/binary"
 	"errors"
+	_ "expvar" // register /debug/vars HTTP handler
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
+	"crypto/rand"
+	mathrand "math/rand"
 	"net"
+	"net/http"
+	_ "net/http/pprof" // register /debug/pprof HTTP handlers
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -129,7 +137,10 @@ func generateKeypair(privkeyFilename, pubkeyFilename string) (err error) {
 	if err != nil {
 		return err
 	}
-	pubkey := noise.PubkeyFromPrivkey(privkey)
+	pubkey, err := noise.PubkeyFromPrivkey(privkey)
+	if err != nil {
+		return fmt.Errorf("deriving public key: %v", err)
+	}
 
 	if privkeyFilename != "" {
 		// Save the privkey to a file.
@@ -190,43 +201,91 @@ func readKeyFromFile(filename string) ([]byte, error) {
 	return noise.ReadKey(f)
 }
 
+// zlibFlushWriter wraps a zlib.Writer and flushes after every Write to
+// prevent buffering-induced hangs in interactive sessions (e.g. SSH).
+type zlibFlushWriter struct {
+	*zlib.Writer
+}
+
+func (w *zlibFlushWriter) Write(p []byte) (int, error) {
+	n, err := w.Writer.Write(p)
+	if err == nil && n > 0 {
+		err = w.Writer.Flush()
+	}
+	return n, err
+}
+
 // proxyStreams bidirectionally copies data between a smux Stream and a TCP
-// connection until both sides are done.
-func proxyStreams(stream *smux.Stream, tcpConn *net.TCPConn, conv uint32) error {
+// connection until both sides are done. When compress is true, data is
+// zlib-compressed on the stream side.
+func proxyStreams(stream *smux.Stream, tcpConn *net.TCPConn, conv uint32, compress bool) error {
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		_, err := io.Copy(stream, tcpConn)
-		if err == io.EOF {
-			// smux Stream.Write may return io.EOF.
-			err = nil
+	if compress {
+		enc := &zlibFlushWriter{zlib.NewWriter(stream)}
+		dec, decErr := zlib.NewReader(stream)
+		if decErr != nil {
+			return fmt.Errorf("stream %08x:%d zlib reader: %v", conv, stream.ID(), decErr)
 		}
-		if err != nil && !errors.Is(err, io.ErrClosedPipe) {
-			log.Printf("stream %08x:%d copy stream←upstream: %v", conv, stream.ID(), err)
-		}
-		tcpConn.CloseRead()
-		stream.Close()
-	}()
-	go func() {
-		defer wg.Done()
-		_, err := io.Copy(tcpConn, stream)
-		if err == io.EOF {
-			// smux Stream.WriteTo may return io.EOF.
-			err = nil
-		}
-		if err != nil && !errors.Is(err, io.ErrClosedPipe) {
-			log.Printf("stream %08x:%d copy upstream←stream: %v", conv, stream.ID(), err)
-		}
-		tcpConn.CloseWrite()
-	}()
+		go func() {
+			defer wg.Done()
+			_, err := io.Copy(enc, tcpConn)
+			if err == io.EOF {
+				err = nil
+			}
+			if err != nil && !errors.Is(err, io.ErrClosedPipe) {
+				log.Printf("stream %08x:%d copy stream←upstream (compressed): %v", conv, stream.ID(), err)
+			}
+			enc.Close()
+			tcpConn.CloseRead()
+			stream.Close()
+		}()
+		go func() {
+			defer wg.Done()
+			_, err := io.Copy(tcpConn, dec)
+			if err == io.EOF {
+				err = nil
+			}
+			if err != nil && !errors.Is(err, io.ErrClosedPipe) {
+				log.Printf("stream %08x:%d copy upstream←stream (compressed): %v", conv, stream.ID(), err)
+			}
+			dec.Close()
+			tcpConn.CloseWrite()
+		}()
+	} else {
+		go func() {
+			defer wg.Done()
+			_, err := io.Copy(stream, tcpConn)
+			if err == io.EOF {
+				// smux Stream.Write may return io.EOF.
+				err = nil
+			}
+			if err != nil && !errors.Is(err, io.ErrClosedPipe) {
+				log.Printf("stream %08x:%d copy stream←upstream: %v", conv, stream.ID(), err)
+			}
+			tcpConn.CloseRead()
+			stream.Close()
+		}()
+		go func() {
+			defer wg.Done()
+			_, err := io.Copy(tcpConn, stream)
+			if err == io.EOF {
+				// smux Stream.WriteTo may return io.EOF.
+				err = nil
+			}
+			if err != nil && !errors.Is(err, io.ErrClosedPipe) {
+				log.Printf("stream %08x:%d copy upstream←stream: %v", conv, stream.ID(), err)
+			}
+			tcpConn.CloseWrite()
+		}()
+	}
 	wg.Wait()
 	return nil
 }
 
 // handleStream bidirectionally connects a client stream with a TCP socket
 // addressed by upstream.
-func handleStream(stream *smux.Stream, upstream string, conv uint32) error {
+func handleStream(stream *smux.Stream, upstream string, conv uint32, compress bool) error {
 	dialer := net.Dialer{
 		Timeout: upstreamDialTimeout,
 	}
@@ -239,17 +298,61 @@ func handleStream(stream *smux.Stream, upstream string, conv uint32) error {
 	if !ok {
 		return fmt.Errorf("stream %08x:%d upstream connection is not a *net.TCPConn", conv, stream.ID())
 	}
-	return proxyStreams(stream, upstreamTCPConn, conv)
+	return proxyStreams(stream, upstreamTCPConn, conv, compress)
 }
+
+// kcpConfig holds tunable KCP parameters.
+type kcpConfig struct {
+	nodelay  int
+	interval int
+	resend   int
+	nc       int
+	window   int
+}
+
+// defaultKCPConfig returns the "normal" KCP configuration.
+func defaultKCPConfig() kcpConfig {
+	return kcpConfig{nodelay: 0, interval: 50, resend: 2, nc: 1, window: 128}
+}
+
+// maxConcurrentStreams is the maximum number of simultaneously open smux
+// streams per KCP session. This bounds goroutine and fd usage per client.
+const maxConcurrentStreams = 100
 
 // acceptStreams wraps a KCP session in a Noise channel and an smux.Session,
 // then awaits smux streams. If upstream is empty, streams are handled as SOCKS5
 // proxy connections; otherwise they are forwarded to the upstream address.
-func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream string) error {
+func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream string, authDB *authDatabase, compress bool) error {
 	// Put a Noise channel on top of the KCP conn.
 	rw, err := noise.NewServer(conn, privkey)
 	if err != nil {
 		return err
+	}
+
+	// Token auth: read 32-byte token before smux, verify it.
+	if authDB != nil {
+		// Guard against clients that complete the Noise handshake but
+		// never send the auth token — without a deadline this goroutine
+		// would block forever, enabling DoS via goroutine/fd exhaustion.
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second)) //nolint:errcheck
+		var token [32]byte
+		if _, err := io.ReadFull(rw, token[:]); err != nil {
+			return fmt.Errorf("reading auth token: %w", err)
+		}
+		conn.SetReadDeadline(time.Time{}) //nolint:errcheck // clear for normal operation
+		if !authDB.Verify(token) {
+			// Respond with DENIED + random padding to avoid a
+			// fixed-length DPI signature.
+			resp := [8]byte{'D', 'E', 'N', 'I', 'E', 'D'}
+			rand.Read(resp[6:]) //nolint:errcheck
+			rw.Write(resp[:])   //nolint:errcheck
+			return fmt.Errorf("unauthorized client %x", token[:8])
+		}
+		// Respond with OK + random padding to avoid a fixed-length DPI
+		// signature on the "client sends 32B, server replies 8B" pattern.
+		resp := [8]byte{'O', 'K'}
+		rand.Read(resp[2:]) //nolint:errcheck
+		rw.Write(resp[:])   //nolint:errcheck
 	}
 
 	// Put an smux session on top of the encrypted Noise channel.
@@ -263,22 +366,34 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream string) error 
 	}
 	defer sess.Close()
 
+	// sem bounds the number of concurrent streams to prevent a single
+	// client from exhausting goroutines and file descriptors.
+	sem := make(chan struct{}, maxConcurrentStreams)
+
 	for {
 		stream, err := sess.AcceptStream()
 		if err != nil {
 			return err
+		}
+		select {
+		case sem <- struct{}{}:
+		default:
+			log.Printf("session %08x: rejecting stream %d (too many concurrent streams)", conn.GetConv(), stream.ID())
+			stream.Close()
+			continue
 		}
 		log.Printf("begin stream %08x:%d", conn.GetConv(), stream.ID())
 		go func() {
 			defer func() {
 				log.Printf("end stream %08x:%d", conn.GetConv(), stream.ID())
 				stream.Close()
+				<-sem
 			}()
 			var err error
 			if upstream == "" {
-				err = handleSocks5Stream(stream, conn.GetConv())
+				err = handleSocks5Stream(stream, conn.GetConv(), compress)
 			} else {
-				err = handleStream(stream, upstream, conn.GetConv())
+				err = handleStream(stream, upstream, conn.GetConv(), compress)
 			}
 			if err != nil {
 				log.Printf("stream %08x:%d: %v", conn.GetConv(), stream.ID(), err)
@@ -289,33 +404,29 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream string) error 
 
 // acceptSessions listens for incoming KCP connections and passes them to
 // acceptStreams.
-func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream string) error {
+func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream string, kcpCfg kcpConfig, authDB *authDatabase, compress bool) error {
 	for {
 		conn, err := ln.AcceptKCP()
 		if err != nil {
 			return err
 		}
 		log.Printf("begin session %08x", conn.GetConv())
+		metricSessions.Add(1)
+		metricActiveSessions.Add(1)
 		// Permit coalescing the payloads of consecutive sends.
 		conn.SetStreamMode(true)
-		// Disable the dynamic congestion window (limit only by the
-		// maximum of local and remote static windows).
-		conn.SetNoDelay(
-			0, // default nodelay
-			0, // default interval
-			0, // default resend
-			1, // nc=1 => congestion window off
-		)
-		conn.SetWindowSize(turbotunnel.QueueSize/2, turbotunnel.QueueSize/2)
+		conn.SetNoDelay(kcpCfg.nodelay, kcpCfg.interval, kcpCfg.resend, kcpCfg.nc)
+		conn.SetWindowSize(kcpCfg.window, kcpCfg.window)
 		if !conn.SetMtu(mtu) {
 			log.Printf("warning: session %08x SetMtu(%d) failed", conn.GetConv(), mtu)
 		}
 		go func() {
 			defer func() {
 				log.Printf("end session %08x", conn.GetConv())
+				metricActiveSessions.Add(-1)
 				conn.Close()
 			}()
-			err := acceptStreams(conn, privkey, upstream)
+			err := acceptStreams(conn, privkey, upstream, authDB, compress)
 			if err != nil && !errors.Is(err, io.ErrClosedPipe) {
 				log.Printf("session %08x acceptStreams: %v", conn.GetConv(), err)
 			}
@@ -360,12 +471,40 @@ func nextPacket(r *bytes.Reader) ([]byte, error) {
 	}
 }
 
+// fakeIPs are plausible IP addresses returned in paranoia mode.
+var fakeIPs = []net.IP{
+	net.ParseIP("104.21.32.1"),
+	net.ParseIP("172.67.128.1"),
+	net.ParseIP("1.1.1.1"),
+}
+
+// paranoidResponse returns a plausible-looking fake DNS response to a query.
+// Used when paranoia mode is enabled to avoid revealing that we are a tunnel.
+func paranoidResponse(query *dns.Message) *dns.Message {
+	resp := &dns.Message{ID: query.ID, Flags: 0x8400, Question: query.Question}
+	if len(query.Question) != 1 {
+		return resp
+	}
+	q := query.Question[0]
+	ip := fakeIPs[mathrand.Intn(len(fakeIPs))]
+	switch q.Type {
+	case dns.RRTypeA:
+		resp.Answer = []dns.RR{{Name: q.Name, Type: dns.RRTypeA, Class: dns.ClassIN, TTL: 300, Data: ip.To4()}}
+	case dns.RRTypeAAAA:
+		resp.Answer = []dns.RR{{Name: q.Name, Type: dns.RRTypeAAAA, Class: dns.ClassIN, TTL: 300, Data: ip.To16()}}
+	default:
+		resp.Flags |= dns.RcodeNameError // NXDOMAIN for types we don't fake
+	}
+	return resp
+}
+
 // responseFor constructs a response dns.Message that is appropriate for query.
 // Along with the dns.Message, it returns the query's decoded data payload. If
 // the returned dns.Message is nil, it means that there should be no response to
 // this query. If the returned dns.Message has an Rcode() of dns.RcodeNoError,
-// the message is a candidate for for carrying downstream data in a TXT record.
-func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
+// the message is a candidate for for carrying downstream data in a TXT or AAAA
+// record. When paranoia is true, non-tunnel queries get plausible fake answers.
+func responseFor(query *dns.Message, domain dns.Name, paranoia bool) (*dns.Message, []byte) {
 	resp := &dns.Message{
 		ID:       query.ID,
 		Flags:    0x8000, // QR = 1, RCODE = no error
@@ -442,6 +581,9 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 	prefix, ok := question.Name.TrimSuffix(domain)
 	if !ok {
 		// Not a name we are authoritative for.
+		if paranoia {
+			return paranoidResponse(query), nil
+		}
 		resp.Flags |= dns.RcodeNameError
 		log.Printf("NXDOMAIN: not authoritative for %s", question.Name)
 		return resp, nil
@@ -455,8 +597,11 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 		return resp, nil
 	}
 
-	if question.Type != dns.RRTypeTXT {
-		// We only support QTYPE == TXT.
+	if question.Type != dns.RRTypeTXT && question.Type != dns.RRTypeAAAA {
+		// We only support QTYPE == TXT or AAAA.
+		if paranoia {
+			return paranoidResponse(query), nil
+		}
 		resp.Flags |= dns.RcodeNameError
 		// No log message here; it's common for recursive resolvers to
 		// send NS or A queries when the client only asked for a TXT. I
@@ -471,6 +616,9 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 	n, err := base32Encoding.Decode(payload, encoded)
 	if err != nil {
 		// Base32 error, make like the name doesn't exist.
+		if paranoia {
+			return paranoidResponse(query), nil
+		}
 		resp.Flags |= dns.RcodeNameError
 		log.Printf("NXDOMAIN: base32 decoding: %v", err)
 		return resp, nil
@@ -507,7 +655,7 @@ type record struct {
 // the incoming DNS queries, and puts them on ttConn's incoming queue. Whenever
 // a query calls for a response, constructs a partial response and passes it to
 // sendLoop over ch.
-func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record, limiter *clientRateLimiter) error {
+func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record, limiter *clientRateLimiter, paranoia bool) error {
 	for {
 		var buf [4096]byte
 		n, addr, err := dnsConn.ReadFrom(buf[:])
@@ -522,7 +670,8 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 			continue
 		}
 
-		resp, payload := responseFor(&query, domain)
+		metricQueries.Add(1)
+		resp, payload := responseFor(&query, domain, paranoia)
 		// Extract the ClientID from the payload.
 		var clientID turbotunnel.ClientID
 		n = copy(clientID[:], payload)
@@ -530,6 +679,7 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 		if n == len(clientID) {
 			// Apply per-client rate limiting if enabled.
 			if limiter != nil && !limiter.Allow(clientID) {
+				metricRateLimited.Add(1)
 				if resp != nil {
 					select {
 					case ch <- &record{resp, addr, clientID}:
@@ -587,84 +737,100 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 		if rec.Resp.Rcode() == dns.RcodeNoError && len(rec.Resp.Question) == 1 {
 			// If it's a non-error response, we can fill the Answer
 			// section with downstream packets.
+			qname := rec.Resp.Question[0].Name
+			qtype := rec.Resp.Question[0].Type
+			qclass := rec.Resp.Question[0].Class
 
-			// Any changes to how responses are built need to happen
-			// also in computeMaxEncodedPayload.
-			rec.Resp.Answer = []dns.RR{
-				{
-					Name:  rec.Resp.Question[0].Name,
-					Type:  rec.Resp.Question[0].Type,
-					Class: rec.Resp.Question[0].Class,
+			if qtype == dns.RRTypeAAAA {
+				// AAAA queries are blend-in polls — respond with a
+				// single zeroed record and do not dequeue any payload.
+				// Pending KCP data stays for the next TXT response,
+				// avoiding resolver-side RRset reordering corruption.
+				rec.Resp.Answer = []dns.RR{{
+					Name:  qname,
+					Type:  dns.RRTypeAAAA,
+					Class: qclass,
 					TTL:   responseTTL,
-					Data:  nil, // will be filled in below
-				},
-			}
-
-			var payload bytes.Buffer
-			limit := maxEncodedPayload
-			// We loop and bundle as many packets from OutgoingQueue
-			// into the response as will fit. Any packet that would
-			// overflow the capacity of the DNS response, we stash
-			// to be bundled into a future response.
-			timer := time.NewTimer(maxResponseDelay)
-			for {
-				var p []byte
-				unstash := ttConn.Unstash(rec.ClientID)
-				outgoing := ttConn.OutgoingQueue(rec.ClientID)
-				// Prioritize taking a packet first from the
-				// stash, then from the outgoing queue, then
-				// finally check for the expiration of the timer
-				// or for a receive on ch (indicating a new
-				// query that we must respond to).
-				select {
-				case p = <-unstash:
-				default:
+					Data:  make([]byte, 16),
+				}}
+			} else {
+				var payload bytes.Buffer
+				limit := maxEncodedPayload
+				// We loop and bundle as many packets from OutgoingQueue
+				// into the response as will fit. Any packet that would
+				// overflow the capacity of the DNS response, we stash
+				// to be bundled into a future response.
+				timer := time.NewTimer(maxResponseDelay)
+				for {
+					var p []byte
+					unstash := ttConn.Unstash(rec.ClientID)
+					outgoing := ttConn.OutgoingQueue(rec.ClientID)
+					// Prioritize taking a packet first from the
+					// stash, then from the outgoing queue, then
+					// finally check for the expiration of the timer
+					// or for a receive on ch (indicating a new
+					// query that we must respond to).
 					select {
 					case p = <-unstash:
-					case p = <-outgoing:
 					default:
 						select {
 						case p = <-unstash:
 						case p = <-outgoing:
-						case <-timer.C:
-						case nextRec = <-ch:
+						default:
+							select {
+							case p = <-unstash:
+							case p = <-outgoing:
+							case <-timer.C:
+							case nextRec = <-ch:
+							}
 						}
 					}
-				}
-				// We wait for the first packet in a bundle
-				// only. The second and later packets must be
-				// immediately available or they will be omitted
-				// from this bundle.
-				timer.Reset(0)
+					// We wait for the first packet in a bundle
+					// only. The second and later packets must be
+					// immediately available or they will be omitted
+					// from this bundle.
+					timer.Reset(0)
 
-				if len(p) == 0 {
-					// timer expired or receive on ch, we
-					// are done with this response.
-					break
-				}
+					if len(p) == 0 {
+						// timer expired or receive on ch, we
+						// are done with this response.
+						break
+					}
 
-				limit -= 2 + len(p)
-				if payload.Len() == 0 {
-					// No packet length check for the first
-					// packet; if it's too large, we allow
-					// it to be truncated and dropped by the
-					// receiver.
-				} else if limit < 0 {
-					// Stash this packet to send in the next
-					// response.
-					ttConn.Stash(p, rec.ClientID)
-					break
+					limit -= 2 + len(p)
+					if payload.Len() == 0 {
+						// No packet length check for the first
+						// packet; if it's too large, we allow
+						// it to be truncated and dropped by the
+						// receiver.
+					} else if limit < 0 {
+						// Stash this packet to send in the next
+						// response.
+						ttConn.Stash(p, rec.ClientID)
+						break
+					}
+					if len(p) > 0xffff {
+						log.Printf("sendLoop: dropping oversized packet of %d bytes", len(p))
+						metricDropped.Add(1)
+						continue
+					}
+					binary.Write(&payload, binary.BigEndian, uint16(len(p)))
+					payload.Write(p)
 				}
-				if len(p) > 0xffff {
-					log.Printf("sendLoop: dropping oversized packet of %d bytes", len(p))
-					continue
+				timer.Stop()
+
+				// Any changes to how TXT responses are built need to
+				// happen also in computeMaxEncodedPayload.
+				rec.Resp.Answer = []dns.RR{
+					{
+						Name:  qname,
+						Type:  qtype,
+						Class: qclass,
+						TTL:   responseTTL,
+						Data:  dns.EncodeRDataTXT(payload.Bytes()),
+					},
 				}
-				binary.Write(&payload, binary.BigEndian, uint16(len(p)))
-				payload.Write(p)
 			}
-			timer.Stop()
-
-			rec.Resp.Answer[0].Data = dns.EncodeRDataTXT(payload.Bytes())
 		}
 
 		buf, err := rec.Resp.WireFormat()
@@ -698,6 +864,7 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 // This function needs to be kept in sync with sendLoop with regard to how it
 // builds candidate responses.
 func computeMaxEncodedPayload(limit int) int {
+	limit -= 64 // safety margin against amplification detection
 	// 64+64+64+62 octets, needs to be base32-decodable.
 	maxLengthName, err := dns.NewName([][]byte{
 		[]byte("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
@@ -730,7 +897,7 @@ func computeMaxEncodedPayload(limit int) int {
 			{
 				Name:  maxLengthName,
 				Type:  dns.RRTypeTXT,
-				Class: dns.RRTypeTXT,
+				Class: dns.ClassIN,
 			},
 		},
 		// EDNS(0)
@@ -744,7 +911,7 @@ func computeMaxEncodedPayload(limit int) int {
 			},
 		},
 	}
-	resp, _ := responseFor(query, dns.Name([][]byte{}))
+	resp, _ := responseFor(query, dns.Name([][]byte{}), false)
 	// As in sendLoop.
 	resp.Answer = []dns.RR{
 		{
@@ -777,7 +944,7 @@ func computeMaxEncodedPayload(limit int) int {
 	return low
 }
 
-func run(ctx context.Context, privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketConn, limiter *clientRateLimiter) error {
+func run(ctx context.Context, privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketConn, limiter *clientRateLimiter, paranoia bool, fecData, fecParity int, kcpCfg kcpConfig, authDB *authDatabase, compress bool) error {
 	defer dnsConn.Close()
 
 	// Close the DNS conn when the context is cancelled to unblock recvLoop.
@@ -786,7 +953,11 @@ func run(ctx context.Context, privkey []byte, domain dns.Name, upstream string, 
 		dnsConn.Close()
 	}()
 
-	log.Printf("pubkey %x", noise.PubkeyFromPrivkey(privkey))
+	pubkey, err := noise.PubkeyFromPrivkey(privkey)
+	if err != nil {
+		return fmt.Errorf("deriving public key: %v", err)
+	}
+	log.Printf("pubkey %x", pubkey)
 
 	// We have a variable amount of room in which to encode downstream
 	// packets in each response, because each response must contain the
@@ -808,13 +979,13 @@ func run(ctx context.Context, privkey []byte, domain dns.Name, upstream string, 
 
 	// Start up the virtual PacketConn for turbotunnel.
 	ttConn := turbotunnel.NewQueuePacketConn(turbotunnel.DummyAddr{}, idleTimeout*2)
-	ln, err := kcp.ServeConn(nil, 0, 0, ttConn)
+	ln, err := kcp.ServeConn(nil, fecData, fecParity, ttConn)
 	if err != nil {
 		return fmt.Errorf("opening KCP listener: %v", err)
 	}
 	defer ln.Close()
 	go func() {
-		err := acceptSessions(ln, privkey, mtu, upstream)
+		err := acceptSessions(ln, privkey, mtu, upstream, kcpCfg, authDB, compress)
 		if err != nil {
 			log.Printf("acceptSessions: %v", err)
 		}
@@ -833,7 +1004,7 @@ func run(ctx context.Context, privkey []byte, domain dns.Name, upstream string, 
 		}
 	}()
 
-	return recvLoop(domain, dnsConn, ttConn, ch, limiter)
+	return recvLoop(domain, dnsConn, ttConn, ch, limiter, paranoia)
 }
 
 func main() {
@@ -845,6 +1016,14 @@ func main() {
 	var socks5Mode bool
 	var rateLimit float64
 	var rateBurst int
+	var debugAddr string
+	var paranoia bool
+	var fecData, fecParity int
+	var kcpMode string
+	var compress bool
+	var configFile string
+	var authKeysFile string
+	logLevel := new(slog.LevelVar) // default INFO
 
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), `Usage:
@@ -868,9 +1047,61 @@ Example:
 	flag.BoolVar(&socks5Mode, "socks5", false, "act as a SOCKS5 proxy (omit UPSTREAMADDR)")
 	flag.Float64Var(&rateLimit, "rate-limit", 0, "maximum DNS queries per second per client (0 = unlimited)")
 	flag.IntVar(&rateBurst, "rate-burst", 50, "burst size for -rate-limit")
+	flag.StringVar(&debugAddr, "debug-addr", "", "address for debug HTTP server exposing /debug/vars and /debug/pprof")
+	flag.BoolVar(&paranoia, "paranoia", false, "return fake DNS answers for non-tunnel queries to hide tunnel presence")
+	flag.IntVar(&fecData, "fec-data", 0, "FEC data shards (0 = disabled)")
+	flag.IntVar(&fecParity, "fec-parity", 0, "FEC parity shards (0 = disabled)")
+	flag.StringVar(&kcpMode, "kcp-mode", "normal", "KCP tuning mode: fast, normal, slow")
+	flag.BoolVar(&compress, "compress", false, "enable zlib compression on streams")
+	flag.StringVar(&configFile, "config", "", "path to YAML config file")
+	flag.StringVar(&authKeysFile, "auth-keys", "", "file containing authorized 32-byte hex tokens (one per line)")
+	flag.Func("log-level", `minimum log level: debug, info, warn, error (default "info")`, func(s string) error {
+		return logLevel.UnmarshalText([]byte(s))
+	})
+
+	// Two-phase parse: pre-scan for -config to load it before flag.Parse().
+	for i, arg := range os.Args[1:] {
+		if arg == "-config" || arg == "--config" {
+			if i+1 < len(os.Args[1:]) {
+				configFile = os.Args[i+2]
+			}
+		} else if strings.HasPrefix(arg, "-config=") {
+			configFile = strings.TrimPrefix(arg, "-config=")
+		} else if strings.HasPrefix(arg, "--config=") {
+			configFile = strings.TrimPrefix(arg, "--config=")
+		}
+	}
+	if configFile != "" {
+		cfg, err := loadServerConfig(configFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "config file: %v\n", err)
+			os.Exit(1)
+		}
+		applyServerConfig(cfg)
+	}
+
 	flag.Parse()
 
-	log.SetFlags(log.LstdFlags | log.LUTC)
+	// Set up structured logging. slog.SetDefault also redirects log.Printf
+	// calls through the slog handler, enabling level filtering for all output.
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: logLevel,
+		ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
+			if a.Key == slog.TimeKey {
+				a.Value = slog.TimeValue(a.Value.Time().UTC())
+			}
+			return a
+		},
+	})))
+
+	if debugAddr != "" {
+		go func() {
+			log.Printf("debug HTTP server listening on %s", debugAddr)
+			if err := http.ListenAndServe(debugAddr, nil); err != nil {
+				log.Printf("debug server: %v", err)
+			}
+		}()
+	}
 
 	if genKey {
 		// -gen-key mode.
@@ -917,6 +1148,14 @@ Example:
 			} else if upstreamIPAddr.IP == nil {
 				fmt.Fprintf(os.Stderr, "cannot parse upstream address %+q: missing host in address\n", upstream)
 				os.Exit(1)
+			}
+			// Do a quick connectivity probe so problems surface at
+			// startup rather than silently on the first client stream.
+			probeConn, probeErr := net.DialTimeout("tcp", upstream, 5*time.Second)
+			if probeErr != nil {
+				log.Printf("warning: upstream %s is not reachable: %v", upstream, probeErr)
+			} else {
+				probeConn.Close()
 			}
 		}
 
@@ -979,10 +1218,36 @@ Example:
 			}()
 		}
 
+		// Parse KCP mode.
+		kcpCfg := defaultKCPConfig()
+		switch kcpMode {
+		case "fast":
+			kcpCfg = kcpConfig{nodelay: 1, interval: 20, resend: 2, nc: 1, window: 256}
+		case "normal":
+			kcpCfg = kcpConfig{nodelay: 0, interval: 50, resend: 2, nc: 1, window: 128}
+		case "slow":
+			kcpCfg = kcpConfig{nodelay: 0, interval: 100, resend: 0, nc: 0, window: 64}
+		default:
+			fmt.Fprintf(os.Stderr, "unknown -kcp-mode %q: must be fast, normal, or slow\n", kcpMode)
+			os.Exit(1)
+		}
+
+		// Load auth keys if specified.
+		var authDB *authDatabase
+		if authKeysFile != "" {
+			var err error
+			authDB, err = loadAuthKeysFile(authKeysFile)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "loading auth keys: %v\n", err)
+				os.Exit(1)
+			}
+			log.Printf("auth: loaded %d keys from %s", authDB.Len(), authKeysFile)
+		}
+
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 
-		err = run(ctx, privkey, domain, upstream, dnsConn, limiter)
+		err = run(ctx, privkey, domain, upstream, dnsConn, limiter, paranoia, fecData, fecParity, kcpCfg, authDB, compress)
 		if err != nil && ctx.Err() == nil {
 			log.Fatal(err)
 		}

@@ -1,2 +1,14 @@
 dnstt-client/dnstt-client
 dnstt-server/dnstt-server
+
+# Key files — never commit private keys or .env to the repo
+keys/
+*.key
+*.pub
+.env
+
+# Editor and OS noise
+.DS_Store
+*.swp
+*.swo
+*~

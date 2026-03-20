@@ -1,7 +1,5 @@
 package main
 
-// DNS over QUIC (DoQ) transport per RFC 9250.
-
 import (
 	"context"
 	"crypto/tls"
@@ -9,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"sync"
 	"time"
 
@@ -16,7 +15,13 @@ import (
 	"www.bamsoftware.com/git/dnstt.git/turbotunnel"
 )
 
-const doqDialTimeout = 30 * time.Second
+const (
+	doqDialTimeout = 30 * time.Second
+
+	// defaultDoQWorkers is the default number of concurrent QUIC stream
+	// workers. Each worker handles one in-flight DoQ query at a time.
+	defaultDoQWorkers = 8
+)
 
 // QUICPacketConn is a QUIC-based transport for DNS messages, used for DNS over
 // QUIC (DoQ). Its WriteTo and ReadFrom methods exchange DNS messages over a
@@ -28,13 +33,19 @@ const doqDialTimeout = 30 * time.Second
 //
 // https://www.rfc-editor.org/rfc/rfc9250
 type QUICPacketConn struct {
+	numWorkers int
 	*turbotunnel.QueuePacketConn
 }
 
 // NewQUICPacketConn creates a new QUICPacketConn configured to use the DoQ
 // server at addr. tlsConfig, if non-nil, is used as the TLS configuration; the
-// "doq" ALPN protocol is appended automatically.
-func NewQUICPacketConn(addr string, tlsConfig *tls.Config) (*QUICPacketConn, error) {
+// "doq" ALPN protocol is appended automatically. numWorkers controls the number
+// of concurrent QUIC stream workers; pass defaultDoQWorkers for a sensible
+// default.
+func NewQUICPacketConn(addr string, tlsConfig *tls.Config, numWorkers int) (*QUICPacketConn, error) {
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
 	if tlsConfig == nil {
 		tlsConfig = &tls.Config{}
 	} else {
@@ -54,6 +65,7 @@ func NewQUICPacketConn(addr string, tlsConfig *tls.Config) (*QUICPacketConn, err
 	}
 
 	c := &QUICPacketConn{
+		numWorkers:      numWorkers,
 		QueuePacketConn: turbotunnel.NewQueuePacketConn(turbotunnel.DummyAddr{}, 0),
 	}
 	go func() {
@@ -66,7 +78,9 @@ func NewQUICPacketConn(addr string, tlsConfig *tls.Config) (*QUICPacketConn, err
 // sendQuery sends a DNS query p over a new QUIC stream on conn and queues the
 // response for return by a future ReadFrom call.
 func (c *QUICPacketConn) sendQuery(conn *quic.Conn, p []byte) error {
-	stream, err := conn.OpenStreamSync(context.Background())
+	// Use the connection's context so OpenStreamSync unblocks immediately
+	// if the QUIC connection dies, rather than blocking forever.
+	stream, err := conn.OpenStreamSync(conn.Context())
 	if err != nil {
 		return fmt.Errorf("opening stream: %v", err)
 	}
@@ -104,21 +118,26 @@ func (c *QUICPacketConn) sendQuery(conn *quic.Conn, p []byte) error {
 	return nil
 }
 
-// run processes outgoing packets using conn, redialing when the connection
-// fails. It exits when the QueuePacketConn is closed.
+// run processes outgoing packets using conn with a fixed worker pool, redialing
+// when the connection fails. It exits when the QueuePacketConn is closed.
 func (c *QUICPacketConn) run(conn *quic.Conn, dial func() (*quic.Conn, error)) {
 	outgoing := c.QueuePacketConn.OutgoingQueue(turbotunnel.DummyAddr{})
 	closed := c.QueuePacketConn.Closed()
+	backoff := dialMinDelay
 	for {
 		connDone := conn.Context().Done()
+		// sem limits the number of concurrent in-flight queries.
+		sem := make(chan struct{}, c.numWorkers)
 		var wg sync.WaitGroup
 	connLoop:
 		for {
 			select {
 			case p := <-outgoing:
+				sem <- struct{}{} // acquire a worker slot
 				wg.Add(1)
 				go func(p []byte) {
 					defer wg.Done()
+					defer func() { <-sem }() // release slot
 					if err := c.sendQuery(conn, p); err != nil {
 						log.Printf("DoQ: %v", err)
 					}
@@ -134,12 +153,30 @@ func (c *QUICPacketConn) run(conn *quic.Conn, dial func() (*quic.Conn, error)) {
 		wg.Wait()
 		conn.CloseWithError(0, "reconnecting")
 
-		var err error
-		conn, err = dial()
-		if err != nil {
-			log.Printf("dial doq: %v", err)
-			return
+		// Retry loop with exponential backoff instead of giving up on the
+		// first failed reconnect attempt.
+		metricDoQReconnects.Add(1)
+		for {
+			jitter := time.Duration(rand.Int63n(int64(backoff)/2+1)) - backoff/4
+			delay := backoff + jitter
+			log.Printf("DoQ: reconnecting in %v", delay)
+			select {
+			case <-time.After(delay):
+			case <-closed:
+				return
+			}
+			var err error
+			conn, err = dial()
+			if err == nil {
+				log.Printf("DoQ: reconnected")
+				backoff = dialMinDelay // reset on success
+				break
+			}
+			log.Printf("DoQ: reconnect failed: %v; retrying", err)
+			backoff *= 2
+			if backoff > dialMaxDelay {
+				backoff = dialMaxDelay
+			}
 		}
-		log.Printf("doq: reconnected to server")
 	}
 }

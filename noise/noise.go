@@ -179,9 +179,13 @@ func NewClient(rwc io.ReadWriteCloser, serverPubkey []byte) (io.ReadWriteCloser,
 func NewServer(rwc io.ReadWriteCloser, serverPrivkey []byte) (io.ReadWriteCloser, error) {
 	config := newConfig()
 	config.Initiator = false
+	pubkey, err := PubkeyFromPrivkey(serverPrivkey)
+	if err != nil {
+		return nil, fmt.Errorf("deriving public key: %v", err)
+	}
 	config.StaticKeypair = noise.DHKey{
 		Private: serverPrivkey,
-		Public:  PubkeyFromPrivkey(serverPrivkey),
+		Public:  pubkey,
 	}
 	handshakeState, err := noise.NewHandshakeState(config)
 	if err != nil {
@@ -222,12 +226,8 @@ func GeneratePrivkey() ([]byte, error) {
 }
 
 // PubkeyFromPrivkey returns the public key that corresponds to privkey.
-func PubkeyFromPrivkey(privkey []byte) []byte {
-	pubkey, err := curve25519.X25519(privkey, curve25519.Basepoint)
-	if err != nil {
-		panic(err)
-	}
-	return pubkey
+func PubkeyFromPrivkey(privkey []byte) ([]byte, error) {
+	return curve25519.X25519(privkey, curve25519.Basepoint)
 }
 
 // ReadKey reads a hex-encoded key from r. r must consist of a single line, with

@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	mathrand "math/rand"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"www.bamsoftware.com/git/dnstt.git/dns"
@@ -28,15 +30,27 @@ const (
 	// poll timer is initially set to initPollDelay. It increases by a
 	// factor of pollDelayMultiplier every time the poll timer expires, up
 	// to a maximum of maxPollDelay. The poll timer is reset to
-	// initPollDelay whenever an a send occurs that is not the result of the
+	// initPollDelay whenever a send occurs that is not the result of the
 	// poll timer expiring.
 	initPollDelay       = 500 * time.Millisecond
 	maxPollDelay        = 10 * time.Second
 	pollDelayMultiplier = 2.0
 
+	// minAdaptivePollDelay is the lower bound for the RTT-based adaptive
+	// poll delay. Prevents polling faster than the round-trip time allows.
+	minAdaptivePollDelay = 50 * time.Millisecond
+
 	// A limit on the number of empty poll requests we may send in a burst
 	// as a result of receiving data.
 	pollLimit = 16
+
+	// rttEWMAAlpha is the smoothing factor for the RTT exponentially
+	// weighted moving average. Smaller values smooth more aggressively.
+	rttEWMAAlpha = 0.125
+
+	// decoyProbability is the 1-in-N chance that a decoy query is sent
+	// after each real data query when obfuscation is enabled.
+	decoyProbability = 5 // ~20% chance
 )
 
 // base32Encoding is a base32 encoding without padding.
@@ -57,11 +71,16 @@ var base32Encoding = base32.StdEncoding.WithPadding(base32.NoPadding)
 // be correlated. When sending a query, we generate a random ID, and when
 // receiving a response, we ignore the ID.
 type DNSPacketConn struct {
-	clientID turbotunnel.ClientID
-	domain   dns.Name
-	// Sending on pollChan permits sendLoop to send an empty polling query.
-	// sendLoop also does its own polling according to a time schedule.
+	clientID  turbotunnel.ClientID
+	domain    dns.Name
+	obfuscate bool
+	// pollChan permits sendLoop to send an empty polling query.
 	pollChan chan struct{}
+	// lastSendAt is updated (as Unix nanoseconds) just before each send,
+	// for RTT measurement.
+	lastSendAt atomic.Int64
+	// rttEWMA stores the EWMA RTT in nanoseconds (0 = no data yet).
+	rttEWMA atomic.Int64
 	// QueuePacketConn is the direct receiver of ReadFrom and WriteTo calls.
 	// recvLoop and sendLoop take the messages out of the receive and send
 	// queues and actually put them on the network.
@@ -71,13 +90,16 @@ type DNSPacketConn struct {
 // NewDNSPacketConn creates a new DNSPacketConn. transport, through its WriteTo
 // and ReadFrom methods, handles the actual sending and receiving the DNS
 // messages encoded by DNSPacketConn. addr is the address to be passed to
-// transport.WriteTo whenever a message needs to be sent.
-func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name) *DNSPacketConn {
+// transport.WriteTo whenever a message needs to be sent. When obfuscate is
+// true, decoy A/AAAA queries are interspersed among real queries to disguise
+// traffic patterns.
+func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name, obfuscate bool) *DNSPacketConn {
 	// Generate a new random ClientID.
 	clientID := turbotunnel.NewClientID()
 	c := &DNSPacketConn{
 		clientID:        clientID,
 		domain:          domain,
+		obfuscate:       obfuscate,
 		pollChan:        make(chan struct{}, pollLimit),
 		QueuePacketConn: turbotunnel.NewQueuePacketConn(clientID, 0),
 	}
@@ -102,8 +124,9 @@ func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name) 
 }
 
 // dnsResponsePayload extracts the downstream payload of a DNS response, encoded
-// into the RDATA of a TXT RR. It returns nil if the message doesn't pass format
-// checks, or if the name in its Question entry is not a subdomain of domain.
+// into the RDATA of a TXT or AAAA RR. It returns nil if the message doesn't
+// pass format checks, or if the name in its Question entry is not a subdomain
+// of domain.
 func dnsResponsePayload(resp *dns.Message, domain dns.Name) []byte {
 	if resp.Flags&0x8000 != 0x8000 {
 		// QR != 1, this is not a response.
@@ -113,27 +136,35 @@ func dnsResponsePayload(resp *dns.Message, domain dns.Name) []byte {
 		return nil
 	}
 
-	if len(resp.Answer) != 1 {
+	if len(resp.Answer) == 0 {
 		return nil
 	}
-	answer := resp.Answer[0]
 
+	// Check the first answer to determine encoding type.
+	answer := resp.Answer[0]
 	_, ok := answer.Name.TrimSuffix(domain)
 	if !ok {
 		// Not the name we are expecting.
 		return nil
 	}
 
-	if answer.Type != dns.RRTypeTXT {
-		// We only support TYPE == TXT.
+	switch answer.Type {
+	case dns.RRTypeTXT:
+		if len(resp.Answer) != 1 {
+			return nil
+		}
+		payload, err := dns.DecodeRDataTXT(answer.Data)
+		if err != nil {
+			return nil
+		}
+		return payload
+	case dns.RRTypeAAAA:
+		// AAAA responses are blend-in polls and carry no payload.
+		// Resolvers may reorder AAAA RRsets, so we never encode data in them.
+		return nil
+	default:
 		return nil
 	}
-	payload, err := dns.DecodeRDataTXT(answer.Data)
-	if err != nil {
-		return nil
-	}
-
-	return payload
 }
 
 // nextPacket reads the next length-prefixed packet from r. It returns a nil
@@ -154,6 +185,38 @@ func nextPacket(r *bytes.Reader) ([]byte, error) {
 		err = io.ErrUnexpectedEOF
 	}
 	return p, err
+}
+
+// updateRTTEWMA updates the RTT EWMA from the recorded lastSendAt time.
+func (c *DNSPacketConn) updateRTTEWMA() {
+	t := c.lastSendAt.Load()
+	if t == 0 {
+		return
+	}
+	rtt := time.Duration(time.Now().UnixNano() - t)
+	if rtt <= 0 {
+		return
+	}
+	old := c.rttEWMA.Load()
+	var next int64
+	if old == 0 {
+		next = int64(rtt)
+	} else {
+		next = int64(rttEWMAAlpha*float64(rtt) + (1-rttEWMAAlpha)*float64(old))
+	}
+	c.rttEWMA.Store(next)
+}
+
+// adaptivePollDelay returns an initPollDelay based on the measured RTT EWMA,
+// or the default initPollDelay if no RTT measurement is available yet.
+func (c *DNSPacketConn) adaptivePollDelay() time.Duration {
+	if ewma := time.Duration(c.rttEWMA.Load()); ewma >= minAdaptivePollDelay {
+		if ewma > maxPollDelay {
+			return maxPollDelay
+		}
+		return ewma
+	}
+	return initPollDelay
 }
 
 // recvLoop repeatedly calls transport.ReadFrom to receive a DNS message,
@@ -214,11 +277,10 @@ func (c *DNSPacketConn) recvLoop(transport net.PacketConn) error {
 			c.QueuePacketConn.QueueIncoming(p, addr)
 		}
 
-		// If the payload contained one or more packets, permit sendLoop
-		// to poll immediately. ACKs on received data will effectively
-		// serve as another stream of polls whose rate is proportional
-		// to the rate of incoming packets.
+		// If the payload contained one or more packets, update RTT and
+		// permit sendLoop to poll immediately.
 		if any {
+			c.updateRTTEWMA()
 			select {
 			case c.pollChan <- struct{}{}:
 			default:
@@ -316,17 +378,27 @@ func (c *DNSPacketConn) send(transport net.PacketConn, p []byte, addr net.Addr) 
 	if err := binary.Read(rand.Reader, binary.BigEndian, &id); err != nil {
 		return fmt.Errorf("generating DNS query ID: %v", err)
 	}
+
+	// For empty poll queries, randomly use AAAA instead of TXT at ~50%
+	// probability to blend in with normal DNS traffic. Data queries always
+	// use TXT because resolvers (Cloudflare, BIND, etc.) may reorder AAAA
+	// RRsets, which would corrupt multi-record payloads.
+	qtype := uint16(dns.RRTypeTXT)
+	if len(p) == 0 && mathrand.Intn(2) == 0 {
+		qtype = dns.RRTypeAAAA
+	}
+
 	query := &dns.Message{
 		ID:    id,
 		Flags: 0x0100, // QR = 0, RD = 1
 		Question: []dns.Question{
 			{
 				Name:  name,
-				Type:  dns.RRTypeTXT,
+				Type:  qtype,
 				Class: dns.ClassIN,
 			},
 		},
-		// EDNS(0)
+		// EDNS(0) with empty Data; padding will be added below.
 		Additional: []dns.RR{
 			{
 				Name:  dns.Name{},
@@ -337,13 +409,77 @@ func (c *DNSPacketConn) send(transport net.PacketConn, p []byte, addr net.Addr) 
 			},
 		},
 	}
+
+	// EDNS(0) Padding (RFC 8467): pad the query to a multiple of 128 bytes.
+	// First serialize without padding to measure the current size.
 	buf, err := query.WireFormat()
+	if err != nil {
+		return err
+	}
+	// 4 = option-code (2 bytes) + option-length (2 bytes)
+	paddingDataLen := (128 - (len(buf)+4)%128) % 128
+	// Build padding option: code=12 (0x000C), length, then zero bytes.
+	paddingOption := make([]byte, 4+paddingDataLen)
+	paddingOption[0] = 0x00
+	paddingOption[1] = 0x0C
+	paddingOption[2] = byte(paddingDataLen >> 8)
+	paddingOption[3] = byte(paddingDataLen)
+	// paddingOption[4:] is already zero
+	query.Additional[0].Data = paddingOption
+	// Re-serialize with padding included.
+	buf, err = query.WireFormat()
 	if err != nil {
 		return err
 	}
 
 	_, err = transport.WriteTo(buf, addr)
 	return err
+}
+
+// sendDecoy sends a fake A or AAAA query to a random-looking domain to obscure
+// traffic patterns. Errors are silently ignored since decoys are best-effort.
+func (c *DNSPacketConn) sendDecoy(transport net.PacketConn, addr net.Addr) {
+	// Generate a random 8-character lowercase label.
+	var labelBytes [8]byte
+	io.ReadFull(rand.Reader, labelBytes[:])
+	label := make([]byte, 8)
+	const alpha = "abcdefghijklmnopqrstuvwxyz"
+	for i, b := range labelBytes {
+		label[i] = alpha[int(b)%len(alpha)]
+	}
+
+	// Pick a plausible-looking TLD.
+	tlds := []string{"com", "net", "org", "io", "co"}
+	tld := tlds[mathrand.Intn(len(tlds))]
+
+	name, err := dns.ParseName(string(label) + "." + tld)
+	if err != nil {
+		return
+	}
+
+	var id uint16
+	if err := binary.Read(rand.Reader, binary.BigEndian, &id); err != nil {
+		return
+	}
+
+	// Alternate between A (1) and AAAA (28).
+	qtype := uint16(1)
+	if mathrand.Intn(2) == 0 {
+		qtype = uint16(28)
+	}
+
+	query := &dns.Message{
+		ID:    id,
+		Flags: 0x0100,
+		Question: []dns.Question{
+			{Name: name, Type: qtype, Class: dns.ClassIN},
+		},
+	}
+	buf, err := query.WireFormat()
+	if err != nil {
+		return
+	}
+	transport.WriteTo(buf, addr) //nolint:errcheck
 }
 
 // sendLoop takes packets that have been written using c.WriteTo, and sends them
@@ -387,14 +523,17 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 			}
 		} else {
 			// We're sending an actual data packet, or we're polling
-			// in response to a received packet. Reset the poll
-			// delay to initial.
+			// in response to a received packet. Reset the poll delay
+			// to the adaptive value based on measured RTT.
 			if !pollTimer.Stop() {
 				<-pollTimer.C
 			}
-			pollDelay = initPollDelay
+			pollDelay = c.adaptivePollDelay()
 		}
 		pollTimer.Reset(pollDelay)
+
+		// Record send time for RTT measurement.
+		c.lastSendAt.Store(time.Now().UnixNano())
 
 		// Unlike in the server, in the client we assume that because
 		// the data capacity of queries is so limited, it's not worth
@@ -402,6 +541,12 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 		err := c.send(transport, p, addr)
 		if err != nil {
 			return err
+		}
+
+		// Obfuscation: occasionally send a decoy query after a real
+		// data packet to disguise traffic patterns.
+		if c.obfuscate && len(p) > 0 && mathrand.Intn(decoyProbability) == 0 {
+			go c.sendDecoy(transport, addr)
 		}
 	}
 }

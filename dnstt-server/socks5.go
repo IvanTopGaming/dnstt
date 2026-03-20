@@ -115,7 +115,7 @@ func socks5Handshake(rw io.ReadWriter) (string, error) {
 // handleSocks5Stream performs a SOCKS5 handshake on stream, then
 // bidirectionally connects it to the target TCP address requested by the
 // client.
-func handleSocks5Stream(stream *smux.Stream, conv uint32) error {
+func handleSocks5Stream(stream *smux.Stream, conv uint32, compress bool) error {
 	target, err := socks5Handshake(stream)
 	if err != nil {
 		return fmt.Errorf("SOCKS5 handshake: %v", err)
@@ -126,7 +126,10 @@ func handleSocks5Stream(stream *smux.Stream, conv uint32) error {
 	dialer := net.Dialer{Timeout: upstreamDialTimeout}
 	conn, err := dialer.Dial("tcp", target)
 	if err != nil {
-		return fmt.Errorf("stream %08x:%d SOCKS5 connect %s: %v", conv, stream.ID(), target, err)
+		// RFC 1928: server MUST send a non-zero REP before closing.
+		// REP=0x04 = Host unreachable, BND.ADDR=0.0.0.0, BND.PORT=0.
+		stream.Write([]byte{0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) //nolint:errcheck
+		return fmt.Errorf("stream %08x:%d SOCKS5 connect %s: %w", conv, stream.ID(), target, err)
 	}
 	defer conn.Close()
 
@@ -136,5 +139,5 @@ func handleSocks5Stream(stream *smux.Stream, conv uint32) error {
 	}
 
 	// Bidirectional copy, same as handleStream.
-	return proxyStreams(stream, tcpConn, conv)
+	return proxyStreams(stream, tcpConn, conv, compress)
 }

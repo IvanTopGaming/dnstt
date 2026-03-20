@@ -1,5 +1,5 @@
 .\" https://man.openbsd.org/mdoc.7
-.Dd 2020-08-30
+.Dd 2026-03-20
 .Dt DNSTT-SERVER 1
 .Os
 
@@ -20,9 +20,8 @@
 .Nm
 .Fl udp Ar ADDR : Ns Ar PORT
 .Op Fl privkey Ar HEX | Fl privkey-file Ar FILENAME
-.Op Fl mtu Ar MTU
-.Ar DOMAIN
-.Ar UPSTREAMADDR : Ns Ar UPSTREAMPORT
+.Op Fl socks5 | Ar DOMAIN Ar UPSTREAMADDR : Ns Ar UPSTREAMPORT
+.Op Fl options...
 
 
 .Sh DESCRIPTION
@@ -32,8 +31,12 @@ is the server portion of a DNS tunnel.
 It receives DNS over UDP messages at
 .Ar ADDR : Ns Ar PORT ,
 decodes the streams they contain,
-and forwards the streams as TCP connections to
+and forwards them as TCP connections to
 .Ar UPSTREAMADDR : Ns Ar UPSTREAMPORT .
+When
+.Fl socks5
+is given, it acts as a SOCKS5 proxy instead.
+
 .Nm
 acts as the authoritative name server for
 .Ar DOMAIN
@@ -43,29 +46,29 @@ via a recursive resolver.
 
 .Ss GENERATING A SERVER KEYPAIR
 
-The tunnel client
-encrypts and authenticates the tunneled connection
-using the server's public key.
-To generate a server keypair, use the
+The tunnel uses end-to-end Noise_NK encryption authenticated by the server's
+public key.
+Generate a keypair with the
 .Fl gen-key
 option.
-Use the
-.Fl privkey-file
-and
-.Fl pubkey-file
-options to save the generated private key,
-public key, or both,
-to a file.
 
 .Bl -tag
 
 .It Fl gen-key
-Generate a server keypair.
+Generate a new server keypair.
+Without
+.Fl privkey-file
+or
+.Fl pubkey-file ,
+prints both keys to standard output.
 
 .It Fl privkey-file Ar FILENAME
 With
 .Fl gen-key ,
 save the generated private key to
+.Ar FILENAME
+(mode 0400).
+In server mode, read the private key from
 .Ar FILENAME .
 
 .It Fl pubkey-file Ar FILENAME
@@ -73,153 +76,224 @@ With
 .Fl gen-key ,
 save the generated public key to
 .Ar FILENAME .
+Not valid in server mode.
 
 .El
 
 .Pp
-On the server, you only need to store the private key, because
+On the server you only need the private key;
 .Nm
-can derive the public key from the private key.
-The client only needs to have the server's public key
-and should not know the servers private key.
-
-.Ss RUNNING THE SERVER
-
-The required
-.Fl udp
-option specifies the UDP address on which
-.Nm
-listens for incoming DNS messages.
-
-.Bl -tag
-.It Fl udp Ar ADDR : Ns Ar PORT
-Accept DNS messages at the given address.
-.Ar PORT
-must typically be 53
-when operating with a recursive intermediate resolver,
-unless you have made some other provision for forwarding
-port 53 to
-.Ar PORT .
-
-.El
-
-.Pp
-Specify the server's persistent keypair using the
-.Fl privkey
+derives the public key automatically.
+Give the public key to clients via
+.Fl pubkey
 or
-.Fl privkey-file
-options.
-If you do not use one of these options,
-.Nm
-generates a temporary keypair
-and logs the public key to standard error.
+.Fl pubkey-file .
+
+
+.Sh OPTIONS
 
 .Bl -tag
+
+.It Fl udp Ar ADDR : Ns Ar PORT
+Listen for incoming DNS queries at the given UDP address.
+.Ar PORT
+must be 53 when operating through a recursive resolver,
+unless you have arranged to forward port 53 to another port.
+Required in server mode.
 
 .It Fl privkey Ar HEX
-.Ar HEX
-is a string of 64 hexadecimal digits.
+Server private key as a string of 64 hexadecimal digits.
 
-.It Fl privkey-file Ar FILENAME
-.Ar FILENAME
-is the name of a file containing
-64 hexadecimal digits and an
-optional training newline character.
+.It Fl mtu Ar BYTES
+Maximum size of UDP DNS response payloads in bytes.
+Default is 1232 (the DNS Flag Day 2020 recommended minimum).
+Reduce this if resolvers on the path only support smaller payloads
+(error message:
+.Dl FORMERR: requester payload size 512 is too small (minimum 1232) ).
 
+.It Fl socks5
+Act as a SOCKS5 proxy.
+In this mode
+.Ar UPSTREAMADDR
+is omitted from the command line.
+Each tunnel stream performs a SOCKS5 handshake; the server connects to
+the address requested by the client.
+Only
+.Cm CONNECT
+with no authentication is supported.
+
+.It Fl auth-keys Ar FILE
+Path to a file of authorized 32-byte client tokens, one token per line,
+each as 64 hexadecimal digits.
+When set, clients must supply a matching token (via
+.Xr dnstt-client 1
+.Fl auth-token )
+after the Noise handshake or they are rejected.
+If this option is omitted, no token check is performed.
+
+.It Fl compress
+Enable zlib compression on tunnel streams.
+Must match the client's
+.Fl compress
+setting.
+
+.It Fl config Ar FILE
+Load flag defaults from a YAML configuration file before parsing
+command-line flags.
+Command-line flags always override file values.
+Keys in the YAML file correspond to flag names
+.Pq e.g. Ql udp: ":53" .
+
+.It Fl debug-addr Ar ADDR : Ns Ar PORT
+Listen for HTTP connections at this address and expose
+.Pa /debug/vars
+and
+.Pa /debug/pprof
+endpoints.
+Intended for development and troubleshooting only; do not expose publicly.
+
+.It Fl fec-data Ar N
+Enable Reed-Solomon forward error correction with
+.Ar N
+data shards.
+Must be combined with
+.Fl fec-parity .
+Requires matching settings on the client.
+0 disables FEC (default).
+
+.It Fl fec-parity Ar N
+Number of FEC parity shards.
+0 disables FEC (default).
+
+.It Fl kcp-mode Ar MODE
+Control KCP reliability/latency tradeoff.
+.Ar MODE
+is one of:
+.Bl -tag -compact
+.It Cm fast
+Low latency, higher CPU and bandwidth.
+.It Cm normal
+Balanced default.
+.It Cm slow
+Conserves bandwidth, higher latency.
 .El
 
-.Pp
-In some situations, you may have to use the
-.Fl mtu
-option to control the maximum UDP payload size.
+.It Fl log-level Ar LEVEL
+Minimum log level to emit.
+.Ar LEVEL
+is one of
+.Cm debug ,
+.Cm info ,
+.Cm warn ,
+or
+.Cm error .
+Default is
+.Cm info .
 
-.Bl -tag
+.It Fl paranoia
+Return plausible-looking fake DNS responses to non-tunnel queries.
+This hides the presence of the tunnel from observers who can see the
+plaintext DNS traffic arriving at the server.
 
-.It Fl mtu Ar MTU
-Never send UDP payloads larger than
-.Ar MTU
-bytes.
-The default
-.Ar MTU
-is 1232, but some recursive resolver only support a maximum of 512.
-You will know you need to use the
-.Fl mtu
-option when you see messages like this on standard error:
-.Dl FORMERR: requester payload size 512 is too small (minimum 1232)
+.It Fl rate-limit Ar RATE
+Maximum DNS queries per second per client (token bucket rate).
+0 (the default) disables rate limiting.
+Use with
+.Fl rate-burst .
+
+.It Fl rate-burst Ar N
+Burst allowance for
+.Fl rate-limit .
+Default is 50.
 
 .El
 
 
 .Sh EXAMPLES
 
-Generate a keypair.
-Save the private key to the file
-.Cm server.key
-and the public key to
-.Cm server.pub .
-Next, you would typically copy
-.Pa server.pub
-to the client.
+Generate a keypair and save to files:
 
 .Bd -literal -offset indent
 dnstt-server -gen-key -privkey-file server.key -pubkey-file server.pub
 .Ed
 
 .Pp
-Accept DNS messages at the UDP address
-.Cm 0.0.0.0:53 ,
-decode the streams contained therein,
-and forward the streams as TCP connections to
-.Cm 127.0.0.1:8000 .
-Read the private key from the file
-.Cm server.key
-and derive the public key from it.
-The server should be configured to be
-the authoritative name server for the domain
-.Cm t.example.com .
+Run the server, forwarding streams to a local HTTP proxy at port 8000:
 
 .Bd -literal -offset indent
-dnstt-server -udp 127.0.0.1:53 -privkey-file server.key t.example.com 127.0.0.1:8000
+dnstt-server -udp :53 -privkey-file server.key t.example.com 127.0.0.1:8000
+.Ed
+
+.Pp
+Run as a SOCKS5 proxy (client decides the destination):
+
+.Bd -literal -offset indent
+dnstt-server -udp :53 -privkey-file server.key -socks5 t.example.com
+.Ed
+
+.Pp
+Run with per-client rate limiting and token authentication:
+
+.Bd -literal -offset indent
+dnstt-server -udp :53 -privkey-file server.key \e
+    -rate-limit 20 -rate-burst 100 \e
+    -auth-keys /etc/dnstt/tokens.txt \e
+    t.example.com 127.0.0.1:8000
+.Ed
+
+.Pp
+Load configuration from a YAML file:
+
+.Bd -literal -offset indent
+dnstt-server -config /etc/dnstt/server.yaml t.example.com 127.0.0.1:8000
 .Ed
 
 
 .Sh DIAGNOSTICS
 
 .Nm
-writes running logs to standard error.
-
-At startup,
-.Nm
-logs its public key.
-This string can be used with the
-.Fl -pubkey
-option in
-.Xr dnstt-client 1 .
+writes structured logs to standard error.
+At startup it logs its public key and the effective MTU:
 
 .Dl pubkey 14ca15f53660e248d289d9302f992c4bee518f2361d6343dafa7b417b5a3d752
-
-.Pp
-At startup,
-.Nm
-logs the amount of useful payload capacity that can be stored
-in each DNS response, after accounting for the overhead of encoding.
-This number will vary depending on the value of
-.Ar MTU .
-
 .Dl effective MTU 932
 
+The public key string can be used with
+.Fl pubkey
+in
+.Xr dnstt-client 1 .
 
-.Pp
-If the recursive resolver's stated maximum UDP payload size
-is smaller than
-.Ar MTU ,
-.Nm
-will log a message like this,
-which tells you that you need to use the
+If the recursive resolver's stated maximum UDP payload size is smaller than the
 .Fl mtu
-option.
+value,
+.Nm
+logs:
 
 .Dl FORMERR: requester payload size 512 is too small (minimum 1232)
+
+Reduce
+.Fl mtu
+to the requester's advertised payload size to resolve this.
+
+
+.Sh SECURITY CONSIDERATIONS
+
+The private key file should be protected with mode 0400 and accessible only
+to the user running
+.Nm .
+The
+.Fl gen-key
+option creates the private key file with this mode automatically.
+
+Token authentication
+.Pq Fl auth-keys
+restricts access to pre-authorized clients.
+Without it, any client that knows the server's public key can use the tunnel.
+
+The
+.Fl paranoia
+option reduces passive detectability but does not provide strong protection
+against an active adversary probing the server.
 
 
 .Sh SEE ALSO
