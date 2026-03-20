@@ -148,20 +148,24 @@ func TestUnexpectedPayload(t *testing.T) {
 	}
 	func() {
 		c, s := net.Pipe()
-		defer s.Close()
 
+		errCh := make(chan error, 1)
 		// Fake a client side that sends a payload.
 		go func() {
 			defer c.Close()
-			err := clientWithPayload(c)
-			if err != nil {
-				t.Fatal(err)
-			}
+			errCh <- clientWithPayload(c)
 		}()
 
 		server, err := NewServer(s, privkey)
+		// Close s to unblock the goroutine (which may be waiting for a
+		// server response that will never come).
+		s.Close()
+
 		if err == nil || err.Error() != "unexpected client payload" || server != nil {
 			t.Errorf("NewServer got (%T, %v)", server, err)
+		}
+		if err := <-errCh; err != nil {
+			t.Errorf("clientWithPayload: %v", err)
 		}
 	}()
 
@@ -199,20 +203,24 @@ func TestUnexpectedPayload(t *testing.T) {
 	}
 	func() {
 		c, s := net.Pipe()
-		defer c.Close()
 
+		errCh := make(chan error, 1)
 		// Fake a server side that sends a payload.
 		go func() {
 			defer s.Close()
-			err := serverWithPayload(s)
-			if err != nil {
-				t.Fatal(err)
-			}
+			errCh <- serverWithPayload(s)
 		}()
 
 		client, err := NewClient(c, pubkey)
+		// Close c to unblock the goroutine (which may be waiting for a
+		// client response that will never come).
+		c.Close()
+
 		if err == nil || err.Error() != "unexpected server payload" || client != nil {
 			t.Errorf("NewClient got (%T, %v)", client, err)
+		}
+		if err := <-errCh; err != nil {
+			t.Errorf("serverWithPayload: %v", err)
 		}
 	}()
 }

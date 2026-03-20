@@ -86,12 +86,17 @@ func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name) 
 		if err != nil {
 			log.Printf("recvLoop: %v", err)
 		}
+		// Close the DNSPacketConn when either loop exits, so the KCP
+		// session detects the failure and terminates promptly instead of
+		// hanging until idleTimeout.
+		c.Close()
 	}()
 	go func() {
 		err := c.sendLoop(transport, addr)
 		if err != nil {
 			log.Printf("sendLoop: %v", err)
 		}
+		c.Close()
 	}()
 	return c
 }
@@ -136,21 +141,19 @@ func dnsResponsePayload(resp *dns.Message, domain dns.Name) []byte {
 // were 0 bytes remaining to read from r. It returns io.ErrUnexpectedEOF when
 // EOF occurs in the middle of an encoded packet.
 func nextPacket(r *bytes.Reader) ([]byte, error) {
-	for {
-		var n uint16
-		err := binary.Read(r, binary.BigEndian, &n)
-		if err != nil {
-			// We may return a real io.EOF only here.
-			return nil, err
-		}
-		p := make([]byte, n)
-		_, err = io.ReadFull(r, p)
-		// Here we must change io.EOF to io.ErrUnexpectedEOF.
-		if err == io.EOF {
-			err = io.ErrUnexpectedEOF
-		}
-		return p, err
+	var n uint16
+	err := binary.Read(r, binary.BigEndian, &n)
+	if err != nil {
+		// We may return a real io.EOF only here.
+		return nil, err
 	}
+	p := make([]byte, n)
+	_, err = io.ReadFull(r, p)
+	// Here we must change io.EOF to io.ErrUnexpectedEOF.
+	if err == io.EOF {
+		err = io.ErrUnexpectedEOF
+	}
+	return p, err
 }
 
 // recvLoop repeatedly calls transport.ReadFrom to receive a DNS message,
@@ -187,10 +190,6 @@ func (c *DNSPacketConn) recvLoop(transport net.PacketConn) error {
 		var buf [4096]byte
 		n, addr, err := transport.ReadFrom(buf[:])
 		if err != nil {
-			if err, ok := err.(net.Error); ok && err.Temporary() {
-				log.Printf("ReadFrom temporary error: %v", err)
-				continue
-			}
 			return err
 		}
 
@@ -314,7 +313,9 @@ func (c *DNSPacketConn) send(transport net.PacketConn, p []byte, addr net.Addr) 
 	}
 
 	var id uint16
-	binary.Read(rand.Reader, binary.BigEndian, &id)
+	if err := binary.Read(rand.Reader, binary.BigEndian, &id); err != nil {
+		return fmt.Errorf("generating DNS query ID: %v", err)
+	}
 	query := &dns.Message{
 		ID:    id,
 		Flags: 0x0100, // QR = 0, RD = 1
@@ -400,8 +401,7 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 		// trying to send more than one packet per query.
 		err := c.send(transport, p, addr)
 		if err != nil {
-			log.Printf("send: %v", err)
-			continue
+			return err
 		}
 	}
 }

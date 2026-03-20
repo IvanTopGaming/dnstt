@@ -28,7 +28,7 @@
 //
 // The -mtu option controls the maximum size of response UDP payloads.
 // Queries that do not advertise requester support for responses of at least
-// this size at least this size will be responded to with a FORMERR. The default
+// this size will be responded to with a FORMERR. The default
 // value is maxUDPPayload.
 //
 // DOMAIN is the root of the DNS zone reserved for the tunnel. See README for
@@ -40,17 +40,19 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base32"
 	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net"
 	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/xtaci/kcp-go/v5"
@@ -188,6 +190,40 @@ func readKeyFromFile(filename string) ([]byte, error) {
 	return noise.ReadKey(f)
 }
 
+// proxyStreams bidirectionally copies data between a smux Stream and a TCP
+// connection until both sides are done.
+func proxyStreams(stream *smux.Stream, tcpConn *net.TCPConn, conv uint32) error {
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, err := io.Copy(stream, tcpConn)
+		if err == io.EOF {
+			// smux Stream.Write may return io.EOF.
+			err = nil
+		}
+		if err != nil && !errors.Is(err, io.ErrClosedPipe) {
+			log.Printf("stream %08x:%d copy stream←upstream: %v", conv, stream.ID(), err)
+		}
+		tcpConn.CloseRead()
+		stream.Close()
+	}()
+	go func() {
+		defer wg.Done()
+		_, err := io.Copy(tcpConn, stream)
+		if err == io.EOF {
+			// smux Stream.WriteTo may return io.EOF.
+			err = nil
+		}
+		if err != nil && !errors.Is(err, io.ErrClosedPipe) {
+			log.Printf("stream %08x:%d copy upstream←stream: %v", conv, stream.ID(), err)
+		}
+		tcpConn.CloseWrite()
+	}()
+	wg.Wait()
+	return nil
+}
+
 // handleStream bidirectionally connects a client stream with a TCP socket
 // addressed by upstream.
 func handleStream(stream *smux.Stream, upstream string, conv uint32) error {
@@ -199,42 +235,16 @@ func handleStream(stream *smux.Stream, upstream string, conv uint32) error {
 		return fmt.Errorf("stream %08x:%d connect upstream: %v", conv, stream.ID(), err)
 	}
 	defer upstreamConn.Close()
-	upstreamTCPConn := upstreamConn.(*net.TCPConn)
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		_, err := io.Copy(stream, upstreamTCPConn)
-		if err == io.EOF {
-			// smux Stream.Write may return io.EOF.
-			err = nil
-		}
-		if err != nil && !errors.Is(err, io.ErrClosedPipe) {
-			log.Printf("stream %08x:%d copy stream←upstream: %v", conv, stream.ID(), err)
-		}
-		upstreamTCPConn.CloseRead()
-		stream.Close()
-	}()
-	go func() {
-		defer wg.Done()
-		_, err := io.Copy(upstreamTCPConn, stream)
-		if err == io.EOF {
-			// smux Stream.WriteTo may return io.EOF.
-			err = nil
-		}
-		if err != nil && !errors.Is(err, io.ErrClosedPipe) {
-			log.Printf("stream %08x:%d copy upstream←stream: %v", conv, stream.ID(), err)
-		}
-		upstreamTCPConn.CloseWrite()
-	}()
-	wg.Wait()
-
-	return nil
+	upstreamTCPConn, ok := upstreamConn.(*net.TCPConn)
+	if !ok {
+		return fmt.Errorf("stream %08x:%d upstream connection is not a *net.TCPConn", conv, stream.ID())
+	}
+	return proxyStreams(stream, upstreamTCPConn, conv)
 }
 
 // acceptStreams wraps a KCP session in a Noise channel and an smux.Session,
-// then awaits smux streams. It passes each stream to handleStream.
+// then awaits smux streams. If upstream is empty, streams are handled as SOCKS5
+// proxy connections; otherwise they are forwarded to the upstream address.
 func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream string) error {
 	// Put a Noise channel on top of the KCP conn.
 	rw, err := noise.NewServer(conn, privkey)
@@ -256,9 +266,6 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream string) error 
 	for {
 		stream, err := sess.AcceptStream()
 		if err != nil {
-			if err, ok := err.(net.Error); ok && err.Temporary() {
-				continue
-			}
 			return err
 		}
 		log.Printf("begin stream %08x:%d", conn.GetConv(), stream.ID())
@@ -267,9 +274,14 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream string) error 
 				log.Printf("end stream %08x:%d", conn.GetConv(), stream.ID())
 				stream.Close()
 			}()
-			err := handleStream(stream, upstream, conn.GetConv())
+			var err error
+			if upstream == "" {
+				err = handleSocks5Stream(stream, conn.GetConv())
+			} else {
+				err = handleStream(stream, upstream, conn.GetConv())
+			}
 			if err != nil {
-				log.Printf("stream %08x:%d handleStream: %v", conn.GetConv(), stream.ID(), err)
+				log.Printf("stream %08x:%d: %v", conn.GetConv(), stream.ID(), err)
 			}
 		}()
 	}
@@ -281,9 +293,6 @@ func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream string) 
 	for {
 		conn, err := ln.AcceptKCP()
 		if err != nil {
-			if err, ok := err.(net.Error); ok && err.Temporary() {
-				continue
-			}
 			return err
 		}
 		log.Printf("begin session %08x", conn.GetConv())
@@ -298,8 +307,8 @@ func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream string) 
 			1, // nc=1 => congestion window off
 		)
 		conn.SetWindowSize(turbotunnel.QueueSize/2, turbotunnel.QueueSize/2)
-		if rc := conn.SetMtu(mtu); !rc {
-			panic(rc)
+		if !conn.SetMtu(mtu) {
+			log.Printf("warning: session %08x SetMtu(%d) failed", conn.GetConv(), mtu)
 		}
 		go func() {
 			defer func() {
@@ -339,7 +348,7 @@ func nextPacket(r *bytes.Reader) ([]byte, error) {
 		}
 		if prefix >= 224 {
 			paddingLen := prefix - 224
-			_, err := io.CopyN(ioutil.Discard, r, int64(paddingLen))
+			_, err := io.CopyN(io.Discard, r, int64(paddingLen))
 			if err != nil {
 				return nil, eof(err)
 			}
@@ -498,15 +507,11 @@ type record struct {
 // the incoming DNS queries, and puts them on ttConn's incoming queue. Whenever
 // a query calls for a response, constructs a partial response and passes it to
 // sendLoop over ch.
-func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record) error {
+func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record, limiter *clientRateLimiter) error {
 	for {
 		var buf [4096]byte
 		n, addr, err := dnsConn.ReadFrom(buf[:])
 		if err != nil {
-			if err, ok := err.(net.Error); ok && err.Temporary() {
-				log.Printf("ReadFrom temporary error: %v", err)
-				continue
-			}
 			return err
 		}
 
@@ -523,6 +528,16 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 		n = copy(clientID[:], payload)
 		payload = payload[n:]
 		if n == len(clientID) {
+			// Apply per-client rate limiting if enabled.
+			if limiter != nil && !limiter.Allow(clientID) {
+				if resp != nil {
+					select {
+					case ch <- &record{resp, addr, clientID}:
+					default:
+					}
+				}
+				continue
+			}
 			// Discard padding and pull out the packets contained in
 			// the payload.
 			r := bytes.NewReader(payload)
@@ -640,8 +655,9 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 					ttConn.Stash(p, rec.ClientID)
 					break
 				}
-				if int(uint16(len(p))) != len(p) {
-					panic(len(p))
+				if len(p) > 0xffff {
+					log.Printf("sendLoop: dropping oversized packet of %d bytes", len(p))
+					continue
 				}
 				binary.Write(&payload, binary.BigEndian, uint16(len(p)))
 				payload.Write(p)
@@ -667,10 +683,6 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 		// Now we actually send the message as a UDP packet.
 		_, err = dnsConn.WriteTo(buf, rec.Addr)
 		if err != nil {
-			if err, ok := err.(net.Error); ok && err.Temporary() {
-				log.Printf("WriteTo temporary error: %v", err)
-				continue
-			}
 			return err
 		}
 	}
@@ -749,7 +761,7 @@ func computeMaxEncodedPayload(limit int) int {
 	low := 0
 	high := 32768
 	for low+1 < high {
-		mid := (low + high) / 2
+		mid := low + (high-low)/2
 		resp.Answer[0].Data = dns.EncodeRDataTXT(make([]byte, mid))
 		buf, err := resp.WireFormat()
 		if err != nil {
@@ -765,8 +777,14 @@ func computeMaxEncodedPayload(limit int) int {
 	return low
 }
 
-func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketConn) error {
+func run(ctx context.Context, privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketConn, limiter *clientRateLimiter) error {
 	defer dnsConn.Close()
+
+	// Close the DNS conn when the context is cancelled to unblock recvLoop.
+	go func() {
+		<-ctx.Done()
+		dnsConn.Close()
+	}()
 
 	log.Printf("pubkey %x", noise.PubkeyFromPrivkey(privkey))
 
@@ -815,7 +833,7 @@ func run(privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketCon
 		}
 	}()
 
-	return recvLoop(domain, dnsConn, ttConn, ch)
+	return recvLoop(domain, dnsConn, ttConn, ch, limiter)
 }
 
 func main() {
@@ -824,15 +842,19 @@ func main() {
 	var privkeyString string
 	var pubkeyFilename string
 	var udpAddr string
+	var socks5Mode bool
+	var rateLimit float64
+	var rateBurst int
 
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), `Usage:
-  %[1]s -gen-key -privkey-file PRIVKEYFILE -pubkey-file PUBKEYFILE
-  %[1]s -udp ADDR -privkey-file PRIVKEYFILE DOMAIN UPSTREAMADDR
+  %[1]s -gen-key [-privkey-file PRIVKEYFILE] [-pubkey-file PUBKEYFILE]
+  %[1]s -udp ADDR [-privkey PRIVKEY|-privkey-file PRIVKEYFILE] [-socks5] DOMAIN [UPSTREAMADDR]
 
 Example:
   %[1]s -gen-key -privkey-file server.key -pubkey-file server.pub
   %[1]s -udp :53 -privkey-file server.key t.example.com 127.0.0.1:8000
+  %[1]s -udp :53 -privkey-file server.key -socks5 t.example.com
 
 `, os.Args[0])
 		flag.PrintDefaults()
@@ -843,6 +865,9 @@ Example:
 	flag.StringVar(&privkeyFilename, "privkey-file", "", "read server private key from file (with -gen-key, write to file)")
 	flag.StringVar(&pubkeyFilename, "pubkey-file", "", "with -gen-key, write server public key to file")
 	flag.StringVar(&udpAddr, "udp", "", "UDP address to listen on (required)")
+	flag.BoolVar(&socks5Mode, "socks5", false, "act as a SOCKS5 proxy (omit UPSTREAMADDR)")
+	flag.Float64Var(&rateLimit, "rate-limit", 0, "maximum DNS queries per second per client (0 = unlimited)")
+	flag.IntVar(&rateBurst, "rate-burst", 50, "burst size for -rate-limit")
 	flag.Parse()
 
 	log.SetFlags(log.LstdFlags | log.LUTC)
@@ -859,7 +884,11 @@ Example:
 		}
 	} else {
 		// Ordinary server mode.
-		if flag.NArg() != 2 {
+		expectedArgs := 2
+		if socks5Mode {
+			expectedArgs = 1
+		}
+		if flag.NArg() != expectedArgs {
 			flag.Usage()
 			os.Exit(1)
 		}
@@ -868,31 +897,24 @@ Example:
 			fmt.Fprintf(os.Stderr, "invalid domain %+q: %v\n", flag.Arg(0), err)
 			os.Exit(1)
 		}
-		upstream := flag.Arg(1)
-		// We keep upstream as a string in order to eventually pass it
-		// to net.Dial in handleStream. But for the sake of displaying
-		// an error or warning at startup, rather than only when the
-		// first stream occurs, we apply some parsing and name
-		// resolution checks here.
-		{
+
+		var upstream string
+		if !socks5Mode {
+			upstream = flag.Arg(1)
+			// We keep upstream as a string in order to eventually pass
+			// it to net.Dial in handleStream. But for the sake of
+			// displaying an error or warning at startup, rather than
+			// only when the first stream occurs, we apply some parsing
+			// and name resolution checks here.
 			upstreamHost, _, err := net.SplitHostPort(upstream)
 			if err != nil {
-				// host:port format is required in all cases, so
-				// this is a fatal error.
 				fmt.Fprintf(os.Stderr, "cannot parse upstream address %+q: %v\n", upstream, err)
 				os.Exit(1)
 			}
 			upstreamIPAddr, err := net.ResolveIPAddr("ip", upstreamHost)
 			if err != nil {
-				// Failure to resolve the host portion is only a
-				// warning. The name will be re-resolved on each
-				// net.Dial in handleStream.
 				log.Printf("warning: cannot resolve upstream host %+q: %v", upstreamHost, err)
 			} else if upstreamIPAddr.IP == nil {
-				// Handle the special case of an empty string
-				// for the host portion, which resolves to a nil
-				// IP. This is a fatal error as we will not be
-				// able to dial this address.
 				fmt.Fprintf(os.Stderr, "cannot parse upstream address %+q: missing host in address\n", upstream)
 				os.Exit(1)
 			}
@@ -943,8 +965,25 @@ Example:
 			}
 		}
 
-		err = run(privkey, domain, upstream, dnsConn)
-		if err != nil {
+		var limiter *clientRateLimiter
+		if rateLimit > 0 {
+			limiter = newClientRateLimiter(rateLimit, rateBurst)
+			log.Printf("rate limiting: %.1f req/s per client, burst %d", rateLimit, rateBurst)
+			// Periodically purge stale client entries.
+			go func() {
+				ticker := time.NewTicker(idleTimeout)
+				defer ticker.Stop()
+				for range ticker.C {
+					limiter.Purge(idleTimeout * 2)
+				}
+			}()
+		}
+
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+
+		err = run(ctx, privkey, domain, upstream, dnsConn, limiter)
+		if err != nil && ctx.Err() == nil {
 			log.Fatal(err)
 		}
 	}

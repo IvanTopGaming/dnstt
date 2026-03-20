@@ -45,13 +45,13 @@ func readMessage(r io.Reader) ([]byte, error) {
 	return msg, err
 }
 
-// writeMessage writes msg as a length-prefixed message to w. It panics if the
-// length of msg cannot be represented in 16 bits.
+// writeMessage writes msg as a length-prefixed message to w. It returns an
+// error if the length of msg cannot be represented in 16 bits.
 func writeMessage(w io.Writer, msg []byte) error {
-	length := uint16(len(msg))
-	if int(length) != len(msg) {
-		panic(len(msg))
+	if len(msg) > 0xffff {
+		return fmt.Errorf("message too long: %d bytes", len(msg))
 	}
+	length := uint16(len(msg))
 	err := binary.Write(w, binary.BigEndian, length)
 	if err != nil {
 		return err
@@ -173,7 +173,7 @@ func NewClient(rwc io.ReadWriteCloser, serverPubkey []byte) (io.ReadWriteCloser,
 	return newSocket(rwc, recvCipher, sendCipher), nil
 }
 
-// NewClient wraps an io.ReadWriteCloser in a Noise protocol as a server, and
+// NewServer wraps an io.ReadWriteCloser in a Noise protocol as a server, and
 // returns after completing the handshake. It returns a non-nil error if there
 // is an error during the handshake.
 func NewServer(rwc io.ReadWriteCloser, serverPrivkey []byte) (io.ReadWriteCloser, error) {

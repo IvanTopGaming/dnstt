@@ -115,7 +115,8 @@ func (c *TLSPacketConn) sendLoop(conn net.Conn) error {
 	for p := range c.QueuePacketConn.OutgoingQueue(turbotunnel.DummyAddr{}) {
 		length := uint16(len(p))
 		if int(length) != len(p) {
-			panic(len(p))
+			log.Printf("sendLoop: dropping packet of %d bytes (too long to encode)", len(p))
+			continue
 		}
 		err := binary.Write(bw, binary.BigEndian, &length)
 		if err != nil {
