@@ -422,14 +422,15 @@ func TestSessionE2E_ParamMismatch(t *testing.T) {
 
 	// Client claims FEC=4/2 — server should reject.
 	clientPayload := encodeHandshakeParams(handshakeParams{FECData: 4, FECParity: 2, Compress: false}, nil)
-	rw, clientErr := noise.NewClient(kcpConn, pubkey, clientPayload)
-	if rw != nil {
-		// Drain whatever the server closes for us so the connection
-		// doesn't keep buffers around. Best-effort.
-		kcpConn.SetReadDeadline(time.Now().Add(2 * time.Second)) //nolint:errcheck
-		_, _ = rw.Read(make([]byte, 1))
-	}
-	_ = clientErr // Either Noise handshake error or post-Noise read failure is fine.
+	_, clientErr := noise.NewClient(kcpConn, pubkey, clientPayload)
+	_ = clientErr // Either a Noise handshake error or nil — the authoritative
+	// assertion is server-side via sessErrCh below. We deliberately do not
+	// touch kcpConn.SetReadDeadline here: NewClient already started a reader
+	// goroutine on kcpConn, and kcp-go v5.6.8 does not synchronise
+	// SetReadDeadline against an in-flight Read on the same UDPSession
+	// (the race detector flags the unsynchronised write to the rd field).
+	// The t.Cleanup-registered kcpConn.Close() unblocks the reader at the
+	// end of the test.
 
 	// The authoritative assertion is server-side: acceptStreams must return
 	// an error mentioning "client param mismatch".
