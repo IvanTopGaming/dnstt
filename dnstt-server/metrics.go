@@ -13,4 +13,7 @@ var (
 	metricRateLimited = expvar.NewInt("queries_rate_limited")
 	// metricDropped counts oversized outgoing packets dropped in sendLoop.
 	metricDropped = expvar.NewInt("packets_dropped")
+	// metricTruncated counts DNS responses rebuilt with TC=1 because the
+	// constructed wire form exceeded maxUDPPayload.
+	metricTruncated = expvar.NewInt("responses_truncated")
 )

@@ -42,6 +42,7 @@ import (
 	"bytes"
 	"compress/zlib"
 	"context"
+	"crypto/sha256"
 	"encoding/base32"
 	"encoding/binary"
 	"errors"
@@ -51,8 +52,6 @@ import (
 	"io"
 	"log"
 	"log/slog"
-	"crypto/rand"
-	mathrand "math/rand"
 	"net"
 	"net/http"
 	_ "net/http/pprof" // register /debug/pprof HTTP handlers
@@ -60,6 +59,7 @@ import (
 	"os/signal"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -322,37 +322,41 @@ const maxConcurrentStreams = 100
 // acceptStreams wraps a KCP session in a Noise channel and an smux.Session,
 // then awaits smux streams. If upstream is empty, streams are handled as SOCKS5
 // proxy connections; otherwise they are forwarded to the upstream address.
-func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream string, authDB *authDatabase, compress bool) error {
+func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream string, authDB *authDatabase, compress bool, serverParams handshakeParams, socks5AllowPrivate bool) error {
 	// Put a Noise channel on top of the KCP conn.
-	rw, err := noise.NewServer(conn, privkey)
+	rw, clientPayload, err := noise.NewServer(conn, privkey)
 	if err != nil {
 		return err
 	}
 
-	// Token auth: read 32-byte token before smux, verify it.
+	// Validate handshake params and (optionally) auth token. Both travel
+	// inside the Noise payload, so authentication is atomic with the
+	// handshake — a missing or wrong token aborts the connection before
+	// any smux processing, eliminating the prior after-Noise read-deadline
+	// DoS vector.
+	clientParams, clientToken, err := decodeHandshakeParams(clientPayload)
+	if err != nil {
+		return fmt.Errorf("invalid handshake params: %w", err)
+	}
+	if err := validateHandshakeParams(clientParams, serverParams); err != nil {
+		return err
+	}
+
 	if authDB != nil {
-		// Guard against clients that complete the Noise handshake but
-		// never send the auth token — without a deadline this goroutine
-		// would block forever, enabling DoS via goroutine/fd exhaustion.
-		conn.SetReadDeadline(time.Now().Add(5 * time.Second)) //nolint:errcheck
+		if clientToken == nil {
+			return fmt.Errorf("auth required: client did not send an auth token")
+		}
 		var token [32]byte
-		if _, err := io.ReadFull(rw, token[:]); err != nil {
-			return fmt.Errorf("reading auth token: %w", err)
-		}
-		conn.SetReadDeadline(time.Time{}) //nolint:errcheck // clear for normal operation
+		copy(token[:], clientToken)
 		if !authDB.Verify(token) {
-			// Respond with DENIED + random padding to avoid a
-			// fixed-length DPI signature.
-			resp := [8]byte{'D', 'E', 'N', 'I', 'E', 'D'}
-			rand.Read(resp[6:]) //nolint:errcheck
-			rw.Write(resp[:])   //nolint:errcheck
-			return fmt.Errorf("unauthorized client %x", token[:8])
+			h := sha256.Sum256(token[:])
+			return fmt.Errorf("unauthorized client (sha256-prefix=%x)", h[:8])
 		}
-		// Respond with OK + random padding to avoid a fixed-length DPI
-		// signature on the "client sends 32B, server replies 8B" pattern.
-		resp := [8]byte{'O', 'K'}
-		rand.Read(resp[2:]) //nolint:errcheck
-		rw.Write(resp[:])   //nolint:errcheck
+	} else if clientToken != nil {
+		// Server has no authDB but client sent a token. Don't fail the
+		// session — the token is just ignored — but log it once so an
+		// operator can notice misconfiguration.
+		log.Printf("session %08x: client sent auth token but server has no -auth-keys", conn.GetConv())
 	}
 
 	// Put an smux session on top of the encrypted Noise channel.
@@ -391,7 +395,7 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream string, authDB
 			}()
 			var err error
 			if upstream == "" {
-				err = handleSocks5Stream(stream, conn.GetConv(), compress)
+				err = handleSocks5Stream(stream, conn.GetConv(), compress, socks5AllowPrivate)
 			} else {
 				err = handleStream(stream, upstream, conn.GetConv(), compress)
 			}
@@ -404,7 +408,7 @@ func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream string, authDB
 
 // acceptSessions listens for incoming KCP connections and passes them to
 // acceptStreams.
-func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream string, kcpCfg kcpConfig, authDB *authDatabase, compress bool) error {
+func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream string, kcpCfg kcpConfig, authDB *authDatabase, compress bool, serverParams handshakeParams, socks5AllowPrivate bool) error {
 	for {
 		conn, err := ln.AcceptKCP()
 		if err != nil {
@@ -426,7 +430,7 @@ func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream string, 
 				metricActiveSessions.Add(-1)
 				conn.Close()
 			}()
-			err := acceptStreams(conn, privkey, upstream, authDB, compress)
+			err := acceptStreams(conn, privkey, upstream, authDB, compress, serverParams, socks5AllowPrivate)
 			if err != nil && !errors.Is(err, io.ErrClosedPipe) {
 				log.Printf("session %08x acceptStreams: %v", conn.GetConv(), err)
 			}
@@ -471,67 +475,86 @@ func nextPacket(r *bytes.Reader) ([]byte, error) {
 	}
 }
 
-// fakeIPs are plausible IP addresses returned in paranoia mode.
-var fakeIPs = []net.IP{
-	net.ParseIP("104.21.32.1"),
-	net.ParseIP("172.67.128.1"),
-	net.ParseIP("1.1.1.1"),
+// truncateLogLast tracks the last time we logged a truncate event, so we
+// don't flood the log when many oversized responses queue up at once.
+var truncateLogLast atomic.Int64
+
+// shouldLogTruncate returns true at most once per second.
+func shouldLogTruncate() bool {
+	now := time.Now().UnixNano()
+	last := truncateLogLast.Load()
+	if now-last < int64(time.Second) {
+		return false
+	}
+	return truncateLogLast.CompareAndSwap(last, now)
 }
 
-// paranoidResponse returns a plausible-looking fake DNS response to a query.
-// Used when paranoia mode is enabled to avoid revealing that we are a tunnel.
-func paranoidResponse(query *dns.Message) *dns.Message {
-	resp := &dns.Message{ID: query.ID, Flags: 0x8400, Question: query.Question}
-	if len(query.Question) != 1 {
-		return resp
+// rebuildAsTruncated converts an oversized DNS response into a valid
+// truncated reply: Question preserved, Answer/Authority cleared, TC=1.
+// If the result still exceeds limit (long Question name + EDNS OPT),
+// EDNS OPT is dropped too.
+func rebuildAsTruncated(resp *dns.Message, limit int) []byte {
+	stripped := &dns.Message{
+		ID:         resp.ID,
+		Flags:      resp.Flags | 0x0200, // TC = 1
+		Question:   resp.Question,
+		Authority:  resp.Authority,  // keep SOA-in-Authority if present
+		Additional: resp.Additional, // keep OPT if present
 	}
-	q := query.Question[0]
-	ip := fakeIPs[mathrand.Intn(len(fakeIPs))]
-	switch q.Type {
-	case dns.RRTypeA:
-		resp.Answer = []dns.RR{{Name: q.Name, Type: dns.RRTypeA, Class: dns.ClassIN, TTL: 300, Data: ip.To4()}}
-	case dns.RRTypeAAAA:
-		resp.Answer = []dns.RR{{Name: q.Name, Type: dns.RRTypeAAAA, Class: dns.ClassIN, TTL: 300, Data: ip.To16()}}
-	default:
-		resp.Flags |= dns.RcodeNameError // NXDOMAIN for types we don't fake
+	buf, err := stripped.WireFormat()
+	if err == nil && len(buf) <= limit {
+		return buf
 	}
-	return resp
+
+	// Fallback 1: drop Authority but keep OPT.
+	stripped.Authority = nil
+	buf, err = stripped.WireFormat()
+	if err == nil && len(buf) <= limit {
+		return buf
+	}
+
+	// Last-ditch: drop OPT too.
+	stripped.Additional = nil
+	buf, err = stripped.WireFormat()
+	if err != nil || len(buf) > limit {
+		// WireFormat shouldn't fail with just header+Question, but if it
+		// does, return whatever we got — the caller's len-check still
+		// guards the wire write.
+		return buf
+	}
+	return buf
 }
 
 // responseFor constructs a response dns.Message that is appropriate for query.
 // Along with the dns.Message, it returns the query's decoded data payload. If
-// the returned dns.Message is nil, it means that there should be no response to
-// this query. If the returned dns.Message has an Rcode() of dns.RcodeNoError,
-// the message is a candidate for for carrying downstream data in a TXT or AAAA
-// record. When paranoia is true, non-tunnel queries get plausible fake answers.
-func responseFor(query *dns.Message, domain dns.Name, paranoia bool) (*dns.Message, []byte) {
+// the returned dns.Message is nil, it means that there should be no response
+// to this query. If the returned dns.Message has an Rcode() of dns.RcodeNoError,
+// the message is a candidate for carrying downstream data in a TXT record.
+//
+// The server impersonates a real authoritative NS for zone.apex: SOA/NS at
+// the apex resolve to the synthesized records in zone; non-tunnel queries
+// at or below the apex return NOERROR/NXDOMAIN with SOA in Authority;
+// queries outside the apex are REFUSED.
+func responseFor(query *dns.Message, zone zoneInfo) (*dns.Message, []byte) {
+	const RcodeRefused = 5
 	resp := &dns.Message{
 		ID:       query.ID,
-		Flags:    0x8000, // QR = 1, RCODE = no error
+		Flags:    0x8000, // QR=1, RCODE=NOERROR
 		Question: query.Question,
 	}
 
+	// QR != 0 means it's a response, not a query — drop.
 	if query.Flags&0x8000 != 0 {
-		// QR != 0, this is not a query. Don't even send a response.
 		return nil, nil
 	}
 
-	// Check for EDNS(0) support. Include our own OPT RR only if we receive
-	// one from the requester.
-	// https://tools.ietf.org/html/rfc6891#section-6.1.1
-	// "Lack of presence of an OPT record in a request MUST be taken as an
-	// indication that the requester does not implement any part of this
-	// specification and that the responder MUST NOT include an OPT record
-	// in its response."
+	// EDNS(0) parsing — same as prior behavior.
 	payloadSize := 0
 	for _, rr := range query.Additional {
 		if rr.Type != dns.RRTypeOPT {
 			continue
 		}
 		if len(resp.Additional) != 0 {
-			// https://tools.ietf.org/html/rfc6891#section-6.1.1
-			// "If a query message with more than one OPT RR is
-			// received, a FORMERR (RCODE=1) MUST be returned."
 			resp.Flags |= dns.RcodeFormatError
 			log.Printf("FORMERR: more than one OPT RR")
 			return resp, nil
@@ -539,7 +562,7 @@ func responseFor(query *dns.Message, domain dns.Name, paranoia bool) (*dns.Messa
 		resp.Additional = append(resp.Additional, dns.RR{
 			Name:  dns.Name{},
 			Type:  dns.RRTypeOPT,
-			Class: 4096, // responder's UDP payload size
+			Class: 4096,
 			TTL:   0,
 			Data:  []byte{},
 		})
@@ -547,96 +570,104 @@ func responseFor(query *dns.Message, domain dns.Name, paranoia bool) (*dns.Messa
 
 		version := (rr.TTL >> 16) & 0xff
 		if version != 0 {
-			// https://tools.ietf.org/html/rfc6891#section-6.1.1
-			// "If a responder does not implement the VERSION level
-			// of the request, then it MUST respond with
-			// RCODE=BADVERS."
 			resp.Flags |= dns.ExtendedRcodeBadVers & 0xf
 			additional.TTL = (dns.ExtendedRcodeBadVers >> 4) << 24
 			log.Printf("BADVERS: EDNS version %d != 0", version)
 			return resp, nil
 		}
-
 		payloadSize = int(rr.Class)
 	}
 	if payloadSize < 512 {
-		// https://tools.ietf.org/html/rfc6891#section-6.1.1 "Values
-		// lower than 512 MUST be treated as equal to 512."
 		payloadSize = 512
 	}
-	// We will return RcodeFormatError if payloadSize is too small, but
-	// first, check the name in order to set the AA bit properly.
 
-	// There must be exactly one question.
+	// Exactly one Question.
 	if len(query.Question) != 1 {
 		resp.Flags |= dns.RcodeFormatError
 		log.Printf("FORMERR: too few or too many questions (%d)", len(query.Question))
 		return resp, nil
 	}
 	question := query.Question[0]
-	// Check the name to see if it ends in our chosen domain, and extract
-	// all that comes before the domain if it does. If it does not, we will
-	// return RcodeNameError below, but prefer to return RcodeFormatError
-	// for payload size if that applies as well.
-	prefix, ok := question.Name.TrimSuffix(domain)
-	if !ok {
-		// Not a name we are authoritative for.
-		if paranoia {
-			return paranoidResponse(query), nil
-		}
-		resp.Flags |= dns.RcodeNameError
-		log.Printf("NXDOMAIN: not authoritative for %s", question.Name)
-		return resp, nil
-	}
-	resp.Flags |= 0x0400 // AA = 1
 
+	// Opcode != 0 not supported.
 	if query.Opcode() != 0 {
-		// We don't support OPCODE != QUERY.
 		resp.Flags |= dns.RcodeNotImplemented
 		log.Printf("NOTIMPL: unrecognized OPCODE %d", query.Opcode())
 		return resp, nil
 	}
 
+	// Outside our zone → REFUSED, no AA.
+	prefix, inside := question.Name.TrimSuffix(zone.apex)
+	if !inside {
+		resp.Flags |= RcodeRefused
+		return resp, nil
+	}
+
+	resp.Flags |= 0x0400 // AA=1
+
+	// Apex (no labels before the suffix). Structural responses fit easily in
+	// 512 bytes, so we answer regardless of EDNS payload size — a real
+	// authoritative NS responds to non-EDNS queries, and FORMERR-on-missing-OPT
+	// is a strong fingerprint that this is not one.
+	if len(prefix) == 0 {
+		switch question.Type {
+		case dns.RRTypeSOA:
+			resp.Answer = []dns.RR{zone.soa}
+		case dns.RRTypeNS:
+			resp.Answer = []dns.RR{zone.ns}
+		default:
+			// NOERROR with no records of this type — Authority carries SOA.
+			resp.Authority = []dns.RR{zone.soa}
+		}
+		return resp, nil
+	}
+
+	// Strictly under apex.
+	// Only TXT and AAAA are tunnel-bearing types; everything else is NXDOMAIN+SOA.
+	// NXDOMAIN+SOA also fits in 512 bytes, so it answers regardless of EDNS.
 	if question.Type != dns.RRTypeTXT && question.Type != dns.RRTypeAAAA {
-		// We only support QTYPE == TXT or AAAA.
-		if paranoia {
-			return paranoidResponse(query), nil
-		}
 		resp.Flags |= dns.RcodeNameError
-		// No log message here; it's common for recursive resolvers to
-		// send NS or A queries when the client only asked for a TXT. I
-		// suspect this is related to QNAME minimization, but I'm not
-		// sure. https://tools.ietf.org/html/rfc7816
-		// log.Printf("NXDOMAIN: QTYPE %d != TXT", question.Type)
+		resp.Authority = []dns.RR{zone.soa}
 		return resp, nil
 	}
 
-	encoded := bytes.ToUpper(bytes.Join(prefix, nil))
-	payload := make([]byte, base32Encoding.DecodedLen(len(encoded)))
-	n, err := base32Encoding.Decode(payload, encoded)
-	if err != nil {
-		// Base32 error, make like the name doesn't exist.
-		if paranoia {
-			return paranoidResponse(query), nil
-		}
-		resp.Flags |= dns.RcodeNameError
-		log.Printf("NXDOMAIN: base32 decoding: %v", err)
-		return resp, nil
-	}
-	payload = payload[:n]
-
-	// We require clients to support EDNS(0) with a minimum payload size;
-	// otherwise we would have to set a small KCP MTU (only around 200
-	// bytes). https://tools.ietf.org/html/rfc6891#section-7 "If there is a
-	// problem with processing the OPT record itself, such as an option
-	// value that is badly formatted or that includes out-of-range values, a
-	// FORMERR MUST be returned."
+	// Tunnel-bearing path: TXT data responses can exceed the requester's
+	// stated payload size. Refuse with FORMERR rather than risk truncation
+	// of in-band tunnel data. AAAA blend responses are small but share the
+	// path for simplicity; tunnel clients always advertise EDNS anyway.
 	if payloadSize < maxUDPPayload {
 		resp.Flags |= dns.RcodeFormatError
 		log.Printf("FORMERR: requester payload size %d is too small (minimum %d)", payloadSize, maxUDPPayload)
 		return resp, nil
 	}
 
+	// Try to base32-decode the prefix.
+	encoded := bytes.ToUpper(bytes.Join(prefix, nil))
+	payload := make([]byte, base32Encoding.DecodedLen(len(encoded)))
+	n, err := base32Encoding.Decode(payload, encoded)
+	if err != nil {
+		resp.Flags |= dns.RcodeNameError
+		resp.Authority = []dns.RR{zone.soa}
+		return resp, nil
+	}
+	payload = payload[:n]
+
+	// AAAA blend-in poll: tunnel data may flow via QNAME (caller extracts
+	// payload from the second return value), but AAAA responses never carry
+	// downstream payload — they look like "no AAAA record exists for this
+	// name", which is what a real auth NS would return.
+	if question.Type == dns.RRTypeAAAA {
+		resp.Authority = []dns.RR{zone.soa}
+		// Validate payload length so a malformed query still returns NXDOMAIN+SOA.
+		if len(payload) < 8 { // ClientID is 8 bytes
+			resp.Flags = (resp.Flags &^ 0xf) | dns.RcodeNameError
+			return resp, nil
+		}
+		return resp, payload
+	}
+
+	// TXT path: tunnel data flows in both directions. sendLoop fills Answer
+	// with downstream payload.
 	return resp, payload
 }
 
@@ -655,7 +686,7 @@ type record struct {
 // the incoming DNS queries, and puts them on ttConn's incoming queue. Whenever
 // a query calls for a response, constructs a partial response and passes it to
 // sendLoop over ch.
-func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record, limiter *clientRateLimiter, paranoia bool) error {
+func recvLoop(zone zoneInfo, dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch chan<- *record, limiter *clientRateLimiter) error {
 	for {
 		var buf [4096]byte
 		n, addr, err := dnsConn.ReadFrom(buf[:])
@@ -671,39 +702,55 @@ func recvLoop(domain dns.Name, dnsConn net.PacketConn, ttConn *turbotunnel.Queue
 		}
 
 		metricQueries.Add(1)
-		resp, payload := responseFor(&query, domain, paranoia)
+		resp, payload := responseFor(&query, zone)
 		// Extract the ClientID from the payload.
 		var clientID turbotunnel.ClientID
-		n = copy(clientID[:], payload)
-		payload = payload[n:]
-		if n == len(clientID) {
-			// Apply per-client rate limiting if enabled.
-			if limiter != nil && !limiter.Allow(clientID) {
-				metricRateLimited.Add(1)
-				if resp != nil {
-					select {
-					case ch <- &record{resp, addr, clientID}:
-					default:
+		if payload != nil {
+			// responseFor returned a tunnel-bearing payload candidate.
+			// Try to extract the ClientID and feed packets to KCP. If
+			// the payload is too short, override the NOERROR response
+			// with NXDOMAIN+SOA so a probe won't see "we accept any
+			// garbage at this name". When payload is nil, the response
+			// is already a complete structural answer (apex SOA/NS,
+			// apex NOERROR no-data, REFUSED, etc.) and must not be
+			// tampered with here.
+			n = copy(clientID[:], payload)
+			payload = payload[n:]
+			if n == len(clientID) {
+				// Apply per-client rate limiting if enabled.
+				if limiter != nil && !limiter.Allow(clientID) {
+					metricRateLimited.Add(1)
+					if resp != nil {
+						select {
+						case ch <- &record{resp, addr, clientID}:
+						default:
+						}
 					}
+					continue
 				}
-				continue
-			}
-			// Discard padding and pull out the packets contained in
-			// the payload.
-			r := bytes.NewReader(payload)
-			for {
-				p, err := nextPacket(r)
-				if err != nil {
-					break
+				// Discard padding and pull out the packets contained in
+				// the payload.
+				r := bytes.NewReader(payload)
+				for {
+					p, err := nextPacket(r)
+					if err != nil {
+						break
+					}
+					// Feed the incoming packet to KCP.
+					ttConn.QueueIncoming(p, clientID)
 				}
-				// Feed the incoming packet to KCP.
-				ttConn.QueueIncoming(p, clientID)
-			}
-		} else {
-			// Payload is not long enough to contain a ClientID.
-			if resp != nil && resp.Rcode() == dns.RcodeNoError {
-				resp.Flags |= dns.RcodeNameError
-				log.Printf("NXDOMAIN: %d bytes are too short to contain a ClientID", n)
+			} else {
+				// Payload is too short to contain a ClientID. responseFor
+				// already handled this for AAAA (returned NXDOMAIN+SOA);
+				// for TXT, we convert the would-be NOERROR into NXDOMAIN
+				// here and ensure Authority has SOA.
+				if resp != nil && resp.Rcode() == dns.RcodeNoError && len(resp.Answer) == 0 {
+					resp.Flags = (resp.Flags &^ 0xf) | dns.RcodeNameError
+					if len(resp.Authority) == 0 {
+						resp.Authority = []dns.RR{zone.soa}
+					}
+					log.Printf("NXDOMAIN: %d bytes are too short to contain a ClientID", n)
+				}
 			}
 		}
 		// If a response is called for, pass it to sendLoop via the channel.
@@ -741,19 +788,15 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 			qtype := rec.Resp.Question[0].Type
 			qclass := rec.Resp.Question[0].Class
 
-			if qtype == dns.RRTypeAAAA {
-				// AAAA queries are blend-in polls — respond with a
-				// single zeroed record and do not dequeue any payload.
-				// Pending KCP data stays for the next TXT response,
-				// avoiding resolver-side RRset reordering corruption.
-				rec.Resp.Answer = []dns.RR{{
-					Name:  qname,
-					Type:  dns.RRTypeAAAA,
-					Class: qclass,
-					TTL:   responseTTL,
-					Data:  make([]byte, 16),
-				}}
-			} else {
+			if qtype == dns.RRTypeTXT && len(rec.Resp.Answer) == 0 {
+				// TXT tunnel response: gather as many KCP packets as
+				// fit, encode them in TXT RDATA. Apex SOA/NS responses
+				// already have Answer filled by responseFor and skip
+				// this branch. AAAA blend-poll responses keep their
+				// empty Answer + SOA-in-Authority (set by responseFor)
+				// and pass through unchanged. Apex A/MX/etc. fall
+				// through with empty Answer + SOA in Authority and
+				// pass through unchanged.
 				var payload bytes.Buffer
 				limit := maxEncodedPayload
 				// We loop and bundle as many packets from OutgoingQueue
@@ -841,9 +884,11 @@ func sendLoop(dnsConn net.PacketConn, ttConn *turbotunnel.QueuePacketConn, ch <-
 		// Truncate if necessary.
 		// https://tools.ietf.org/html/rfc1035#section-4.1.1
 		if len(buf) > maxUDPPayload {
-			log.Printf("truncating response of %d bytes to max of %d", len(buf), maxUDPPayload)
-			buf = buf[:maxUDPPayload]
-			buf[2] |= 0x02 // TC = 1
+			metricTruncated.Add(1)
+			if shouldLogTruncate() {
+				log.Printf("truncating response of %d bytes to max of %d", len(buf), maxUDPPayload)
+			}
+			buf = rebuildAsTruncated(rec.Resp, maxUDPPayload)
 		}
 
 		// Now we actually send the message as a UDP packet.
@@ -911,7 +956,7 @@ func computeMaxEncodedPayload(limit int) int {
 			},
 		},
 	}
-	resp, _ := responseFor(query, dns.Name([][]byte{}), false)
+	resp, _ := responseFor(query, newZoneInfo(dns.Name{}))
 	// As in sendLoop.
 	resp.Answer = []dns.RR{
 		{
@@ -944,7 +989,11 @@ func computeMaxEncodedPayload(limit int) int {
 	return low
 }
 
-func run(ctx context.Context, privkey []byte, domain dns.Name, upstream string, dnsConn net.PacketConn, limiter *clientRateLimiter, paranoia bool, fecData, fecParity int, kcpCfg kcpConfig, authDB *authDatabase, compress bool) error {
+func run(ctx context.Context, privkey []byte, zone zoneInfo, upstream string, dnsConn net.PacketConn, limiter *clientRateLimiter, fecData, fecParity int, kcpCfg kcpConfig, authDB *authDatabase, compress bool, socks5AllowPrivate bool) error {
+	serverParams, err := newHandshakeParamsFromInts(fecData, fecParity, compress)
+	if err != nil {
+		return err
+	}
 	defer dnsConn.Close()
 
 	// Close the DNS conn when the context is cancelled to unblock recvLoop.
@@ -957,7 +1006,7 @@ func run(ctx context.Context, privkey []byte, domain dns.Name, upstream string, 
 	if err != nil {
 		return fmt.Errorf("deriving public key: %v", err)
 	}
-	log.Printf("pubkey %x", pubkey)
+	slog.Debug("server pubkey", "hex", fmt.Sprintf("%x", pubkey))
 
 	// We have a variable amount of room in which to encode downstream
 	// packets in each response, because each response must contain the
@@ -985,7 +1034,7 @@ func run(ctx context.Context, privkey []byte, domain dns.Name, upstream string, 
 	}
 	defer ln.Close()
 	go func() {
-		err := acceptSessions(ln, privkey, mtu, upstream, kcpCfg, authDB, compress)
+		err := acceptSessions(ln, privkey, mtu, upstream, kcpCfg, authDB, compress, serverParams, socks5AllowPrivate)
 		if err != nil {
 			log.Printf("acceptSessions: %v", err)
 		}
@@ -1004,7 +1053,7 @@ func run(ctx context.Context, privkey []byte, domain dns.Name, upstream string, 
 		}
 	}()
 
-	return recvLoop(domain, dnsConn, ttConn, ch, limiter, paranoia)
+	return recvLoop(zone, dnsConn, ttConn, ch, limiter)
 }
 
 func main() {
@@ -1017,7 +1066,6 @@ func main() {
 	var rateLimit float64
 	var rateBurst int
 	var debugAddr string
-	var paranoia bool
 	var fecData, fecParity int
 	var kcpMode string
 	var compress bool
@@ -1045,10 +1093,11 @@ Example:
 	flag.StringVar(&pubkeyFilename, "pubkey-file", "", "with -gen-key, write server public key to file")
 	flag.StringVar(&udpAddr, "udp", "", "UDP address to listen on (required)")
 	flag.BoolVar(&socks5Mode, "socks5", false, "act as a SOCKS5 proxy (omit UPSTREAMADDR)")
+	var socks5AllowPrivate bool
+	flag.BoolVar(&socks5AllowPrivate, "socks5-allow-private", false, "allow SOCKS5 connections to RFC1918/ULA/CGNAT addresses (loopback and link-local stay denied)")
 	flag.Float64Var(&rateLimit, "rate-limit", 0, "maximum DNS queries per second per client (0 = unlimited)")
 	flag.IntVar(&rateBurst, "rate-burst", 50, "burst size for -rate-limit")
 	flag.StringVar(&debugAddr, "debug-addr", "", "address for debug HTTP server exposing /debug/vars and /debug/pprof")
-	flag.BoolVar(&paranoia, "paranoia", false, "return fake DNS answers for non-tunnel queries to hide tunnel presence")
 	flag.IntVar(&fecData, "fec-data", 0, "FEC data shards (0 = disabled)")
 	flag.IntVar(&fecParity, "fec-parity", 0, "FEC parity shards (0 = disabled)")
 	flag.StringVar(&kcpMode, "kcp-mode", "normal", "KCP tuning mode: fast, normal, slow")
@@ -1247,7 +1296,8 @@ Example:
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
 
-		err = run(ctx, privkey, domain, upstream, dnsConn, limiter, paranoia, fecData, fecParity, kcpCfg, authDB, compress)
+		zone := newZoneInfo(domain)
+		err = run(ctx, privkey, zone, upstream, dnsConn, limiter, fecData, fecParity, kcpCfg, authDB, compress, socks5AllowPrivate)
 		if err != nil && ctx.Err() == nil {
 			log.Fatal(err)
 		}

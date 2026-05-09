@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -115,7 +116,7 @@ func socks5Handshake(rw io.ReadWriter) (string, error) {
 // handleSocks5Stream performs a SOCKS5 handshake on stream, then
 // bidirectionally connects it to the target TCP address requested by the
 // client.
-func handleSocks5Stream(stream *smux.Stream, conv uint32, compress bool) error {
+func handleSocks5Stream(stream *smux.Stream, conv uint32, compress bool, allowPrivate bool) error {
 	target, err := socks5Handshake(stream)
 	if err != nil {
 		return fmt.Errorf("SOCKS5 handshake: %v", err)
@@ -123,8 +124,28 @@ func handleSocks5Stream(stream *smux.Stream, conv uint32, compress bool) error {
 
 	log.Printf("stream %08x:%d SOCKS5 CONNECT %s", conv, stream.ID(), target)
 
+	host, port, splitErr := net.SplitHostPort(target)
+	if splitErr != nil {
+		// Malformed target — refuse with REP=0x01 (general failure).
+		stream.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) //nolint:errcheck
+		return fmt.Errorf("stream %08x:%d SOCKS5 bad target %q: %v", conv, stream.ID(), target, splitErr)
+	}
+
+	// Bound the resolve+connect to a single deadline. resolveAllowedDestination
+	// pre-resolves hostnames and re-checks each result against the deny-list,
+	// closing the SSRF hole where ATYP=0x03 hostnames (e.g. "localhost",
+	// "metadata.google.internal") would otherwise reach the dialer's resolver.
+	ctx, cancel := context.WithTimeout(context.Background(), upstreamDialTimeout)
+	defer cancel()
+	dialTarget, denyErr := resolveAllowedDestination(ctx, host, port, allowPrivate)
+	if denyErr != nil {
+		// REP=0x02 = connection not allowed by ruleset, ATYP=1, BND.ADDR=0.0.0.0, BND.PORT=0
+		stream.Write([]byte{0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0}) //nolint:errcheck
+		return fmt.Errorf("stream %08x:%d SOCKS5 connect %s: %v", conv, stream.ID(), target, denyErr)
+	}
+
 	dialer := net.Dialer{Timeout: upstreamDialTimeout}
-	conn, err := dialer.Dial("tcp", target)
+	conn, err := dialer.DialContext(ctx, "tcp", dialTarget)
 	if err != nil {
 		// RFC 1928: server MUST send a non-zero REP before closing.
 		// REP=0x04 = Host unreachable, BND.ADDR=0.0.0.0, BND.PORT=0.

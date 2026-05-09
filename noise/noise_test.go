@@ -5,8 +5,6 @@ import (
 	"io"
 	"net"
 	"testing"
-
-	"github.com/flynn/noise"
 )
 
 func allMessages(buf []byte) ([][]byte, error) {
@@ -104,126 +102,44 @@ func TestReadKey(t *testing.T) {
 	}
 }
 
-func TestUnexpectedPayload(t *testing.T) {
+func TestHandshake_PayloadRoundTrip(t *testing.T) {
 	privkey, err := GeneratePrivkey()
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
 	pubkey, err := PubkeyFromPrivkey(privkey)
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
 
-	// Test the client sending an unexpected payload.
-	clientWithPayload := func(rwc io.ReadWriteCloser) error {
-		config := newConfig()
-		config.Initiator = true
-		config.PeerStatic = pubkey
-		handshakeState, err := noise.NewHandshakeState(config)
-		if err != nil {
-			return err
-		}
+	c, s := net.Pipe()
+	defer c.Close()
+	defer s.Close()
 
-		// -> e, es
-		msg, _, _, err := handshakeState.WriteMessage(nil, []byte("payload"))
-		if err != nil {
-			return err
-		}
-		err = writeMessage(rwc, msg)
-		if err != nil {
-			return err
-		}
+	want := []byte{0x01, 0x02, 0x03, 0x04}
 
-		// <- e, es
-		// Return nil for all errors after this point, because we expect
-		// the server to have failed, but we want to keep up the game
-		// just in case the server did not fail.
-		msg, err = readMessage(rwc)
-		if err != nil {
-			return nil
-		}
-		_, _, _, err = handshakeState.ReadMessage(nil, msg)
-		if err != nil {
-			return nil
-		}
-
-		return nil
+	// Server: read payload from client.
+	type srvResult struct {
+		payload []byte
+		err     error
 	}
-	func() {
-		c, s := net.Pipe()
-
-		errCh := make(chan error, 1)
-		// Fake a client side that sends a payload.
-		go func() {
-			defer c.Close()
-			errCh <- clientWithPayload(c)
-		}()
-
-		server, err := NewServer(s, privkey)
-		// Close s to unblock the goroutine (which may be waiting for a
-		// server response that will never come).
-		s.Close()
-
-		if err == nil || err.Error() != "unexpected client payload" || server != nil {
-			t.Errorf("NewServer got (%T, %v)", server, err)
-		}
-		if err := <-errCh; err != nil {
-			t.Errorf("clientWithPayload: %v", err)
-		}
+	srvCh := make(chan srvResult, 1)
+	go func() {
+		_, payload, err := NewServer(s, privkey)
+		srvCh <- srvResult{payload, err}
 	}()
 
-	// Test the server sending an unexpected payload.
-	serverWithPayload := func(rwc io.ReadWriteCloser) error {
-		config := newConfig()
-		config.Initiator = false
-		config.StaticKeypair = noise.DHKey{Private: privkey, Public: pubkey}
-		handshakeState, err := noise.NewHandshakeState(config)
-		if err != nil {
-			return err
-		}
-
-		// -> e, es
-		msg, err := readMessage(rwc)
-		if err != nil {
-			return err
-		}
-		_, _, _, err = handshakeState.ReadMessage(nil, msg)
-		if err != nil {
-			return err
-		}
-
-		// <- e, es
-		msg, _, _, err = handshakeState.WriteMessage(nil, []byte("payload"))
-		if err != nil {
-			return err
-		}
-		err = writeMessage(rwc, msg)
-		if err != nil {
-			return err
-		}
-
-		return nil
+	// Client: send payload.
+	_, err = NewClient(c, pubkey, want)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
 	}
-	func() {
-		c, s := net.Pipe()
 
-		errCh := make(chan error, 1)
-		// Fake a server side that sends a payload.
-		go func() {
-			defer s.Close()
-			errCh <- serverWithPayload(s)
-		}()
-
-		client, err := NewClient(c, pubkey)
-		// Close c to unblock the goroutine (which may be waiting for a
-		// client response that will never come).
-		c.Close()
-
-		if err == nil || err.Error() != "unexpected server payload" || client != nil {
-			t.Errorf("NewClient got (%T, %v)", client, err)
-		}
-		if err := <-errCh; err != nil {
-			t.Errorf("serverWithPayload: %v", err)
-		}
-	}()
+	r := <-srvCh
+	if r.err != nil {
+		t.Fatalf("NewServer: %v", r.err)
+	}
+	if !bytes.Equal(r.payload, want) {
+		t.Fatalf("server got payload %x, want %x", r.payload, want)
+	}
 }

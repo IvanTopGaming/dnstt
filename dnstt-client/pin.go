@@ -9,8 +9,9 @@ import (
 )
 
 // parsePinSet parses a comma-separated list of "SHA256:<hex>" certificate pins
-// and returns a set of 32-byte SHA-256 hashes. Each pin matches any certificate
-// in the server's chain (leaf or intermediate).
+// and returns a set of 32-byte SHA-256 hashes. A pin must match the SHA-256
+// hash of the leaf certificate's DER bytes; intermediates and roots are not
+// consulted. Pair with makePinnedTLSConfig to install the resulting set.
 func parsePinSet(s string) (map[[32]byte]struct{}, error) {
 	pins := make(map[[32]byte]struct{})
 	for _, part := range strings.Split(s, ",") {
@@ -39,20 +40,25 @@ func parsePinSet(s string) (map[[32]byte]struct{}, error) {
 	return pins, nil
 }
 
-// makePinnedTLSConfig returns a clone of base with certificate pinning applied.
-// Standard hostname verification is replaced by a check that at least one
-// certificate in the server's chain matches a pin in pins.
-func makePinnedTLSConfig(pins map[[32]byte]struct{}, base *tls.Config) *tls.Config {
+// makePinnedTLSConfig returns a clone of base with leaf-only certificate
+// pinning applied. The leaf certificate's SHA-256 hash must match an entry
+// in pins. By default the standard chain validation runs in addition to
+// the pin check; if skipChain is true, pin alone replaces the entire
+// certificate-authority trust path (use only when pinning a self-signed
+// cert).
+func makePinnedTLSConfig(pins map[[32]byte]struct{}, base *tls.Config, skipChain bool) *tls.Config {
 	cfg := base.Clone()
-	cfg.InsecureSkipVerify = true // hostname check replaced by pin check below
+	cfg.InsecureSkipVerify = skipChain
 	cfg.VerifyConnection = func(cs tls.ConnectionState) error {
-		for _, cert := range cs.PeerCertificates {
-			h := sha256.Sum256(cert.Raw)
-			if _, ok := pins[h]; ok {
-				return nil
-			}
+		if len(cs.PeerCertificates) == 0 {
+			return fmt.Errorf("certificate pinning: no peer certificates presented")
 		}
-		return fmt.Errorf("certificate pinning: none of the %d peer certificates matched a pin", len(cs.PeerCertificates))
+		leaf := cs.PeerCertificates[0]
+		h := sha256.Sum256(leaf.Raw)
+		if _, ok := pins[h]; !ok {
+			return fmt.Errorf("certificate pinning: leaf certificate did not match any pin")
+		}
+		return nil
 	}
 	return cfg
 }

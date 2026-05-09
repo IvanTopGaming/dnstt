@@ -135,10 +135,10 @@ func newConfig() noise.Config {
 	}
 }
 
-// NewClient wraps an io.ReadWriteCloser in a Noise protocol as a client, and
-// returns after completing the handshake. It returns a non-nil error if there
-// is an error during the handshake.
-func NewClient(rwc io.ReadWriteCloser, serverPubkey []byte) (io.ReadWriteCloser, error) {
+// NewClient wraps an io.ReadWriteCloser in a Noise protocol as a client and
+// returns after completing the handshake. clientPayload, if non-nil, is sent
+// in the first handshake message and visible to the server.
+func NewClient(rwc io.ReadWriteCloser, serverPubkey, clientPayload []byte) (io.ReadWriteCloser, error) {
 	config := newConfig()
 	config.Initiator = true
 	config.PeerStatic = serverPubkey
@@ -147,8 +147,8 @@ func NewClient(rwc io.ReadWriteCloser, serverPubkey []byte) (io.ReadWriteCloser,
 		return nil, err
 	}
 
-	// -> e, es
-	msg, _, _, err := handshakeState.WriteMessage(nil, nil)
+	// -> e, es (with optional payload)
+	msg, _, _, err := handshakeState.WriteMessage(nil, clientPayload)
 	if err != nil {
 		return nil, err
 	}
@@ -173,15 +173,15 @@ func NewClient(rwc io.ReadWriteCloser, serverPubkey []byte) (io.ReadWriteCloser,
 	return newSocket(rwc, recvCipher, sendCipher), nil
 }
 
-// NewServer wraps an io.ReadWriteCloser in a Noise protocol as a server, and
-// returns after completing the handshake. It returns a non-nil error if there
-// is an error during the handshake.
-func NewServer(rwc io.ReadWriteCloser, serverPrivkey []byte) (io.ReadWriteCloser, error) {
+// NewServer wraps an io.ReadWriteCloser in a Noise protocol as a server and
+// returns after completing the handshake. The client's first-message payload
+// (possibly empty) is returned to the caller for protocol negotiation.
+func NewServer(rwc io.ReadWriteCloser, serverPrivkey []byte) (io.ReadWriteCloser, []byte, error) {
 	config := newConfig()
 	config.Initiator = false
 	pubkey, err := PubkeyFromPrivkey(serverPrivkey)
 	if err != nil {
-		return nil, fmt.Errorf("deriving public key: %v", err)
+		return nil, nil, fmt.Errorf("deriving public key: %v", err)
 	}
 	config.StaticKeypair = noise.DHKey{
 		Private: serverPrivkey,
@@ -189,33 +189,30 @@ func NewServer(rwc io.ReadWriteCloser, serverPrivkey []byte) (io.ReadWriteCloser
 	}
 	handshakeState, err := noise.NewHandshakeState(config)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	// -> e, es
+	// -> e, es (read client payload)
 	msg, err := readMessage(rwc)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	payload, _, _, err := handshakeState.ReadMessage(nil, msg)
+	clientPayload, _, _, err := handshakeState.ReadMessage(nil, msg)
 	if err != nil {
-		return nil, err
-	}
-	if len(payload) != 0 {
-		return nil, errors.New("unexpected client payload")
+		return nil, nil, err
 	}
 
-	// <- e, es
+	// <- e, es (no server payload)
 	msg, recvCipher, sendCipher, err := handshakeState.WriteMessage(nil, nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	err = writeMessage(rwc, msg)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	return newSocket(rwc, recvCipher, sendCipher), nil
+	return newSocket(rwc, recvCipher, sendCipher), clientPayload, nil
 }
 
 // GeneratePrivkey generates a private key. The corresponding public key can be

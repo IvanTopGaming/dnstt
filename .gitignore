@@ -1,6 +1,10 @@
 dnstt-client/dnstt-client
 dnstt-server/dnstt-server
 
+# Per-developer launcher scripts with deployment-specific defaults
+# (pubkey, domain). Keep locally; do not commit.
+start-client.sh
+
 # Key files — never commit private keys or .env to the repo
 keys/
 *.key

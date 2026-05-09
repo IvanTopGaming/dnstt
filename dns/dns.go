@@ -47,6 +47,8 @@ var (
 const (
 	// https://tools.ietf.org/html/rfc1035#section-3.2.2
 	RRTypeA   = 1
+	RRTypeNS  = 2
+	RRTypeSOA = 6
 	RRTypeTXT = 16
 	// https://tools.ietf.org/html/rfc3596#section-2.1
 	RRTypeAAAA = 28

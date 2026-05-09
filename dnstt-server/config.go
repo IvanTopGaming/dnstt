@@ -10,20 +10,20 @@ import (
 
 // ServerConfig holds configuration values that can be set via YAML file.
 type ServerConfig struct {
-	UDP         string  `yaml:"udp"`
-	PrivkeyFile string  `yaml:"privkey-file"`
-	Socks5      bool    `yaml:"socks5"`
-	RateLimit   float64 `yaml:"rate-limit"`
-	RateBurst   int     `yaml:"rate-burst"`
-	MTU         int     `yaml:"mtu"`
-	Paranoia    bool    `yaml:"paranoia"`
-	FECData     int     `yaml:"fec-data"`
-	FECParity   int     `yaml:"fec-parity"`
-	KCPMode     string  `yaml:"kcp-mode"`
-	Compress    bool    `yaml:"compress"`
-	AuthKeys    string  `yaml:"auth-keys"`
-	DebugAddr   string  `yaml:"debug-addr"`
-	LogLevel    string  `yaml:"log-level"`
+	UDP                string  `yaml:"udp"`
+	PrivkeyFile        string  `yaml:"privkey-file"`
+	Socks5             bool    `yaml:"socks5"`
+	Socks5AllowPrivate bool    `yaml:"socks5-allow-private"`
+	RateLimit          float64 `yaml:"rate-limit"`
+	RateBurst          int     `yaml:"rate-burst"`
+	MTU                int     `yaml:"mtu"`
+	FECData            int     `yaml:"fec-data"`
+	FECParity          int     `yaml:"fec-parity"`
+	KCPMode            string  `yaml:"kcp-mode"`
+	Compress           bool    `yaml:"compress"`
+	AuthKeys           string  `yaml:"auth-keys"`
+	DebugAddr          string  `yaml:"debug-addr"`
+	LogLevel           string  `yaml:"log-level"`
 }
 
 func loadServerConfig(filename string) (*ServerConfig, error) {
@@ -66,9 +66,6 @@ func applyServerConfig(cfg *ServerConfig) {
 	if cfg.MTU != 0 {
 		setDefault("mtu", fmt.Sprintf("%d", cfg.MTU))
 	}
-	// Boolean flags are always applied so that "paranoia: false" in the
-	// config can explicitly disable a flag, not just silently skip it.
-	setDefault("paranoia", fmt.Sprintf("%v", cfg.Paranoia))
 	if cfg.FECData != 0 {
 		setDefault("fec-data", fmt.Sprintf("%d", cfg.FECData))
 	}
@@ -89,4 +86,5 @@ func applyServerConfig(cfg *ServerConfig) {
 		setDefault("log-level", cfg.LogLevel)
 	}
 	setDefault("socks5", fmt.Sprintf("%v", cfg.Socks5))
+	setDefault("socks5-allow-private", fmt.Sprintf("%v", cfg.Socks5AllowPrivate))
 }

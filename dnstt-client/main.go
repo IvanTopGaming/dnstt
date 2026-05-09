@@ -277,24 +277,18 @@ func sessionLoop(ctx context.Context, pubkey []byte, domain dns.Name, ln *net.TC
 		return fmt.Errorf("SetMtu(%d) failed", mtu)
 	}
 
-	// Put a Noise channel on top of the KCP conn.
-	rw, err := noise.NewClient(conn, pubkey)
+	// Build the Noise handshake payload with the client's advertised
+	// parameters and (if -auth-token was given) the auth token. Server
+	// validates both inside the handshake — no separate post-Noise
+	// auth round-trip.
+	clientPayload := encodeHandshakeParams(handshakeParams{
+		FECData:   uint8(fecData),
+		FECParity: uint8(fecParity),
+		Compress:  compress,
+	}, authToken)
+	rw, err := noise.NewClient(conn, pubkey, clientPayload)
 	if err != nil {
 		return err
-	}
-
-	// Token auth: send 32-byte token and wait for server acknowledgement.
-	if authToken != nil {
-		if _, err := rw.Write(authToken); err != nil {
-			return fmt.Errorf("sending auth token: %v", err)
-		}
-		resp := make([]byte, 8)
-		if _, err := io.ReadFull(rw, resp); err != nil {
-			return fmt.Errorf("reading auth response: %v", err)
-		}
-		if string(resp[:2]) != "OK" {
-			return fmt.Errorf("auth denied by server")
-		}
 	}
 
 	// Start a smux session on the Noise channel.
@@ -427,8 +421,8 @@ func main() {
 	var utlsDistribution string
 	var debugAddr string
 	var autoTransport bool
-	var obfuscate bool
 	var pinCerts string
+	var pinSkipChain bool
 	var rotateID int
 	var kcpMode string
 	var fecData, fecParity int
@@ -485,15 +479,15 @@ Known TLS fingerprints for -utls are:
 		"choose TLS fingerprint from weighted distribution")
 	flag.StringVar(&debugAddr, "debug-addr", "", "address for debug HTTP server exposing /debug/vars and /debug/pprof")
 	flag.BoolVar(&autoTransport, "auto", false, "auto-select transport: try DoQ→DoT→DoH→UDP in order")
-	flag.BoolVar(&obfuscate, "obfuscate", false, "send decoy A/AAAA queries to disguise traffic patterns")
 	flag.StringVar(&pinCerts, "pin-cert", "", "comma-separated SHA256:<hex> certificate pins for DoT/DoH/DoQ")
+	flag.BoolVar(&pinSkipChain, "pin-cert-skip-chain", false, "with -pin-cert: skip CA chain validation and trust only the pin (use for self-signed pinning)")
 	flag.IntVar(&rotateID, "rotate-id", 0, "rotate ClientID every N minutes (0 = disabled)")
 	flag.StringVar(&kcpMode, "kcp-mode", "normal", "KCP tuning mode: fast, normal, slow")
 	flag.IntVar(&fecData, "fec-data", 0, "FEC data shards (0 = disabled)")
 	flag.IntVar(&fecParity, "fec-parity", 0, "FEC parity shards (0 = disabled)")
 	flag.BoolVar(&multipath, "multipath", false, "use all configured transports simultaneously (DoH, DoT, UDP only)")
 	flag.BoolVar(&compress, "compress", false, "enable zlib compression on streams")
-	flag.StringVar(&authToken, "auth-token", "", fmt.Sprintf("64-hex-char auth token to send to server after handshake"))
+	flag.StringVar(&authToken, "auth-token", "", "64-hex-char auth token sent in the Noise handshake")
 	flag.Func("log-level", `minimum log level: debug, info, warn, error (default "info")`, func(s string) error {
 		return logLevel.UnmarshalText([]byte(s))
 	})
@@ -519,6 +513,13 @@ Known TLS fingerprints for -utls are:
 	}
 
 	flag.Parse()
+
+	// Validate FEC params at startup so out-of-range values fail fast,
+	// before any KCP setup or reconnect loop.
+	if _, err := newHandshakeParamsFromInts(fecData, fecParity, compress); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 
 	// Set up structured logging. slog.SetDefault also redirects log.Printf
 	// calls through the slog handler, enabling level filtering for all output.
@@ -602,7 +603,7 @@ Known TLS fingerprints for -utls are:
 	// Build a base TLS config, applying cert pins if requested.
 	baseTLSConfig := &tls.Config{}
 	if pins != nil {
-		baseTLSConfig = makePinnedTLSConfig(pins, baseTLSConfig)
+		baseTLSConfig = makePinnedTLSConfig(pins, baseTLSConfig, pinSkipChain)
 	}
 
 	if dohAddr != "" && dohURL == "" {
@@ -647,7 +648,7 @@ Known TLS fingerprints for -utls are:
 		if err != nil {
 			return nil, nil, err
 		}
-		return NewDNSPacketConn(pconn, addr, domain, obfuscate), addr, nil
+		return pconn, addr, nil
 	}
 
 	makeDoQ := func() (net.PacketConn, net.Addr, error) {
@@ -676,7 +677,7 @@ Known TLS fingerprints for -utls are:
 		if err != nil {
 			return nil, nil, err
 		}
-		return NewDNSPacketConn(pconn, addr, domain, obfuscate), addr, nil
+		return pconn, addr, nil
 	}
 
 	makeUDP := func() (net.PacketConn, net.Addr, error) {
@@ -693,7 +694,7 @@ Known TLS fingerprints for -utls are:
 		// actual UDP packets to the correct resolver.
 		fixed := &fixedAddrConn{udpConn, remoteAddr}
 		addr := turbotunnel.DummyAddr{}
-		return NewDNSPacketConn(fixed, addr, domain, obfuscate), addr, nil
+		return fixed, addr, nil
 	}
 
 	// Parse KCP mode.
@@ -730,8 +731,6 @@ Known TLS fingerprints for -utls are:
 	var makeConn func() (net.PacketConn, error)
 
 	if multipath {
-		// Multipath: create all DNS-encoded transports simultaneously and
-		// wrap them in a MultiPacketConn with a single DNSPacketConn on top.
 		var conns []net.PacketConn
 		if dohURL != "" {
 			pconn, _, err := makeDoH()
@@ -761,45 +760,50 @@ Known TLS fingerprints for -utls are:
 			fmt.Fprintf(os.Stderr, "-multipath requires at least two of -doh, -dot, -udp\n")
 			os.Exit(1)
 		}
-		// Multipath: bump KCP window to 512 so out-of-order packets
-		// arriving via transports with different latencies (e.g.
-		// DoQ=20ms vs DoT=200ms) don't stall the session.
+		// Multipath: bump KCP window to 512 so out-of-order packets arriving
+		// via transports with different latencies don't stall the session.
 		if kcpCfg.window < 512 {
 			kcpCfg.window = 512
 		}
 		multi := NewMultiPacketConn(conns)
-		var once sync.Once
+		dnsConn := NewDNSPacketConn(multi, turbotunnel.DummyAddr{}, domain)
+		firstConn := dnsConn
+		firstUsed := false
 		makeConn = func() (net.PacketConn, error) {
-			// Return the already-created multi conn; on reconnect recreate.
-			var result net.PacketConn
-			once.Do(func() { result = multi })
-			if result != nil {
-				return result, nil
+			if !firstUsed {
+				firstUsed = true
+				return firstConn, nil
 			}
-			// Reconnect: rebuild each transport.
+			// Reconnect: rebuild every transport. Log per-transport failures so
+			// silent degradation (e.g., DoH down → 2-of-3 path) is visible.
 			var newConns []net.PacketConn
 			if dohURL != "" {
 				if p, _, e := makeDoH(); e == nil {
 					newConns = append(newConns, p)
+				} else {
+					log.Printf("multipath reconnect: DoH unavailable: %v", e)
 				}
 			}
 			if dotAddr != "" {
 				if p, _, e := makeDoT(); e == nil {
 					newConns = append(newConns, p)
+				} else {
+					log.Printf("multipath reconnect: DoT unavailable: %v", e)
 				}
 			}
 			if udpAddr != "" {
 				if p, _, e := makeUDP(); e == nil {
 					newConns = append(newConns, p)
+				} else {
+					log.Printf("multipath reconnect: UDP unavailable: %v", e)
 				}
 			}
 			if len(newConns) == 0 {
 				return nil, fmt.Errorf("all multipath transports failed")
 			}
-			return NewMultiPacketConn(newConns), nil
+			return NewDNSPacketConn(NewMultiPacketConn(newConns), turbotunnel.DummyAddr{}, domain), nil
 		}
 	} else if autoTransport {
-		// Collect whichever transports have addresses configured.
 		type candidate struct {
 			name string
 			make transportMaker
@@ -828,51 +832,68 @@ Known TLS fingerprints for -utls are:
 			os.Exit(1)
 		}
 		makeConn = func() (net.PacketConn, error) {
-			pconn, _, err := tryTransports(makers)
-			return pconn, err
+			bare, _, err := tryTransports(makers)
+			if err != nil {
+				return nil, err
+			}
+			// DoQ is already DNS-message-level; everything else needs a DNS wrap.
+			if _, isDoQ := bare.(*QUICPacketConn); isDoQ {
+				return bare, nil
+			}
+			return NewDNSPacketConn(bare, turbotunnel.DummyAddr{}, domain), nil
 		}
 	} else {
-		// Exactly one transport must be specified.
 		type opt struct {
-			s    string
-			make func() (net.PacketConn, net.Addr, error)
+			s     string
+			make  func() (net.PacketConn, net.Addr, error)
+			isDoQ bool
 		}
 		opts := []opt{
-			{dohURL, makeDoH},
-			{doqAddr, makeDoQ},
-			{dotAddr, makeDoT},
-			{udpAddr, makeUDP},
+			{dohURL, makeDoH, false},
+			{doqAddr, makeDoQ, true},
+			{dotAddr, makeDoT, false},
+			{udpAddr, makeUDP, false},
 		}
-		var chosen func() (net.PacketConn, net.Addr, error)
-		for _, o := range opts {
-			if o.s == "" {
+		var chosen *opt
+		for i := range opts {
+			if opts[i].s == "" {
 				continue
 			}
 			if chosen != nil {
 				fmt.Fprintf(os.Stderr, "only one of -doh, -doq, -dot, and -udp may be given (or use -auto)\n")
 				os.Exit(1)
 			}
-			chosen = o.make
+			chosen = &opts[i]
 		}
 		if chosen == nil {
 			fmt.Fprintf(os.Stderr, "one of -doh, -doq, -dot, -udp, or -auto is required\n")
 			os.Exit(1)
 		}
-		// Verify connectivity immediately so errors surface at startup.
-		pconn, _, err := chosen()
+		bare, _, err := chosen.make()
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
-		firstConn := pconn
+		var firstConn net.PacketConn
+		if chosen.isDoQ {
+			firstConn = bare
+		} else {
+			firstConn = NewDNSPacketConn(bare, turbotunnel.DummyAddr{}, domain)
+		}
 		firstUsed := false
 		makeConn = func() (net.PacketConn, error) {
 			if !firstUsed {
 				firstUsed = true
 				return firstConn, nil
 			}
-			p, _, err := chosen()
-			return p, err
+			bare, _, err := chosen.make()
+			if err != nil {
+				return nil, err
+			}
+			if chosen.isDoQ {
+				return bare, nil
+			}
+			return NewDNSPacketConn(bare, turbotunnel.DummyAddr{}, domain), nil
 		}
 	}
 

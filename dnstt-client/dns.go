@@ -47,10 +47,6 @@ const (
 	// rttEWMAAlpha is the smoothing factor for the RTT exponentially
 	// weighted moving average. Smaller values smooth more aggressively.
 	rttEWMAAlpha = 0.125
-
-	// decoyProbability is the 1-in-N chance that a decoy query is sent
-	// after each real data query when obfuscation is enabled.
-	decoyProbability = 5 // ~20% chance
 )
 
 // base32Encoding is a base32 encoding without padding.
@@ -71,9 +67,8 @@ var base32Encoding = base32.StdEncoding.WithPadding(base32.NoPadding)
 // be correlated. When sending a query, we generate a random ID, and when
 // receiving a response, we ignore the ID.
 type DNSPacketConn struct {
-	clientID  turbotunnel.ClientID
-	domain    dns.Name
-	obfuscate bool
+	clientID turbotunnel.ClientID
+	domain   dns.Name
 	// pollChan permits sendLoop to send an empty polling query.
 	pollChan chan struct{}
 	// lastSendAt is updated (as Unix nanoseconds) just before each send,
@@ -90,16 +85,13 @@ type DNSPacketConn struct {
 // NewDNSPacketConn creates a new DNSPacketConn. transport, through its WriteTo
 // and ReadFrom methods, handles the actual sending and receiving the DNS
 // messages encoded by DNSPacketConn. addr is the address to be passed to
-// transport.WriteTo whenever a message needs to be sent. When obfuscate is
-// true, decoy A/AAAA queries are interspersed among real queries to disguise
-// traffic patterns.
-func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name, obfuscate bool) *DNSPacketConn {
+// transport.WriteTo whenever a message needs to be sent.
+func NewDNSPacketConn(transport net.PacketConn, addr net.Addr, domain dns.Name) *DNSPacketConn {
 	// Generate a new random ClientID.
 	clientID := turbotunnel.NewClientID()
 	c := &DNSPacketConn{
 		clientID:        clientID,
 		domain:          domain,
-		obfuscate:       obfuscate,
 		pollChan:        make(chan struct{}, pollLimit),
 		QueuePacketConn: turbotunnel.NewQueuePacketConn(clientID, 0),
 	}
@@ -317,29 +309,29 @@ func chunks(p []byte, n int) [][]byte {
 //
 //  0. Start with the raw packet contents.
 //
-//	supercalifragilisticexpialidocious
+//     supercalifragilisticexpialidocious
 //
 //  1. Length-prefix the packet and add random padding. A length prefix L < 0xe0
 //     means a data packet of L bytes. A length prefix L ≥ 0xe0 means padding
 //     of L − 0xe0 bytes (not counting the length of the length prefix itself).
 //
-//	\xe3\xd9\xa3\x15\x22supercalifragilisticexpialidocious
+//     \xe3\xd9\xa3\x15\x22supercalifragilisticexpialidocious
 //
 //  2. Prefix the ClientID.
 //
-//	CLIENTID\xe3\xd9\xa3\x15\x22supercalifragilisticexpialidocious
+//     CLIENTID\xe3\xd9\xa3\x15\x22supercalifragilisticexpialidocious
 //
 //  3. Base32-encode, without padding and in lower case.
 //
-//	ingesrkokreujy6zumkse43vobsxey3bnruwm4tbm5uwy2ltoruwgzlyobuwc3djmrxwg2lpovzq
+//     ingesrkokreujy6zumkse43vobsxey3bnruwm4tbm5uwy2ltoruwgzlyobuwc3djmrxwg2lpovzq
 //
 //  4. Break into labels of at most 63 octets.
 //
-//	ingesrkokreujy6zumkse43vobsxey3bnruwm4tbm5uwy2ltoruwgzlyobuwc3d.jmrxwg2lpovzq
+//     ingesrkokreujy6zumkse43vobsxey3bnruwm4tbm5uwy2ltoruwgzlyobuwc3d.jmrxwg2lpovzq
 //
 //  5. Append the domain.
 //
-//	ingesrkokreujy6zumkse43vobsxey3bnruwm4tbm5uwy2ltoruwgzlyobuwc3d.jmrxwg2lpovzq.t.example.com
+//     ingesrkokreujy6zumkse43vobsxey3bnruwm4tbm5uwy2ltoruwgzlyobuwc3d.jmrxwg2lpovzq.t.example.com
 func (c *DNSPacketConn) send(transport net.PacketConn, p []byte, addr net.Addr) error {
 	var decoded []byte
 	{
@@ -436,52 +428,6 @@ func (c *DNSPacketConn) send(transport net.PacketConn, p []byte, addr net.Addr) 
 	return err
 }
 
-// sendDecoy sends a fake A or AAAA query to a random-looking domain to obscure
-// traffic patterns. Errors are silently ignored since decoys are best-effort.
-func (c *DNSPacketConn) sendDecoy(transport net.PacketConn, addr net.Addr) {
-	// Generate a random 8-character lowercase label.
-	var labelBytes [8]byte
-	io.ReadFull(rand.Reader, labelBytes[:])
-	label := make([]byte, 8)
-	const alpha = "abcdefghijklmnopqrstuvwxyz"
-	for i, b := range labelBytes {
-		label[i] = alpha[int(b)%len(alpha)]
-	}
-
-	// Pick a plausible-looking TLD.
-	tlds := []string{"com", "net", "org", "io", "co"}
-	tld := tlds[mathrand.Intn(len(tlds))]
-
-	name, err := dns.ParseName(string(label) + "." + tld)
-	if err != nil {
-		return
-	}
-
-	var id uint16
-	if err := binary.Read(rand.Reader, binary.BigEndian, &id); err != nil {
-		return
-	}
-
-	// Alternate between A (1) and AAAA (28).
-	qtype := uint16(1)
-	if mathrand.Intn(2) == 0 {
-		qtype = uint16(28)
-	}
-
-	query := &dns.Message{
-		ID:    id,
-		Flags: 0x0100,
-		Question: []dns.Question{
-			{Name: name, Type: qtype, Class: dns.ClassIN},
-		},
-	}
-	buf, err := query.WireFormat()
-	if err != nil {
-		return
-	}
-	transport.WriteTo(buf, addr) //nolint:errcheck
-}
-
 // sendLoop takes packets that have been written using c.WriteTo, and sends them
 // on the network using send. It also does polling with empty packets when
 // requested by pollChan or after a timeout.
@@ -541,12 +487,6 @@ func (c *DNSPacketConn) sendLoop(transport net.PacketConn, addr net.Addr) error 
 		err := c.send(transport, p, addr)
 		if err != nil {
 			return err
-		}
-
-		// Obfuscation: occasionally send a decoy query after a real
-		// data packet to disguise traffic patterns.
-		if c.obfuscate && len(p) > 0 && mathrand.Intn(decoyProbability) == 0 {
-			go c.sendDecoy(transport, addr)
 		}
 	}
 }

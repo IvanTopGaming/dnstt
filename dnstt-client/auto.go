@@ -6,9 +6,9 @@ import (
 	"net"
 )
 
-// transportMaker is a function that creates a transport PacketConn along with
-// the remote address to use for WriteTo calls. The returned PacketConn is
-// already wrapped in a DNSPacketConn if appropriate.
+// transportMaker is a function that creates a bare transport PacketConn
+// along with the remote address to use for WriteTo calls. The caller is
+// responsible for wrapping non-DoQ transports in a DNSPacketConn.
 type transportMaker func() (net.PacketConn, net.Addr, error)
 
 // tryTransports attempts each non-nil maker in order and returns the first
